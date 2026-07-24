@@ -439,7 +439,21 @@ pub async fn handle_agent_event(
             attempt,
             delay_ms,
             message,
+            continuing,
         } => {
+            if continuing {
+                *was_reasoning = false;
+                if *agent_line_started {
+                    renderer.write_line("", Color::White)?;
+                    *agent_line_started = false;
+                }
+                session.add_partial_assistant_output(response_buf, Vec::new());
+                response_buf.clear();
+                *response_start_line = None;
+                session.add_message(MessageRole::User, "Go");
+                renderer.write_line("> Go", Color::Green)?;
+                save_session_if_enabled(session, cli, renderer)?;
+            }
             let safe = sanitize_output(&message);
             renderer.write_line(
                 &format!(

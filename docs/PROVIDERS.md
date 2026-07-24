@@ -160,6 +160,20 @@ This is an upstream rig limitation, not zerostack-specific.
 
 **Recommendation:** if you happen to have both API keys, Anthropic direct is marginally cheaper. If you don't, OpenRouter Claude with caching captures most of the savings.
 
+## Provider retries
+
+Interactive provider requests retry transient failures with exponential backoff:
+2, 4, 8, 16, then 30 seconds between subsequent attempts. Retryable failures
+include HTTP 408, 429, and all 5xx responses, plus provider overload,
+unavailability, rate-limit, timeout, exhausted-capacity, and transient connection
+errors. Authentication, invalid requests, context overflow, billing and account
+usage limits, unsupported models, and content-policy failures are not retried.
+
+When a failure follows partial output, zerostack preserves that assistant output,
+appends a synthetic `Go` user message, and continues from the resulting history.
+This keeps the model aware of text and completed tool interactions from the failed
+request instead of replaying the original request blindly.
+
 ## CLI Flags
 
 | Flag                | Env var       | Description                         |

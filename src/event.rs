@@ -137,6 +137,7 @@ pub enum AgentEvent {
         attempt: u32,
         delay_ms: u64,
         message: CompactString,
+        continuing: bool,
     },
     Error {
         message: CompactString,

@@ -65,7 +65,8 @@ fn done_usages(
 fn streamed_reasoning_text<R>(content: &StreamedAssistantContent<R>) -> Option<CompactString> {
     match content {
         StreamedAssistantContent::Reasoning(reasoning) => {
-            Some(CompactString::new(reasoning.display_text()))
+            let text = reasoning.display_text();
+            (!text.is_empty()).then(|| CompactString::new(text))
         }
         StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
             if reasoning.is_empty() {
@@ -87,13 +88,30 @@ fn streamed_provider_reasoning<R>(
     }
 }
 
-const PROVIDER_RETRY_DELAYS_MS: [u64; 3] = [1_000, 2_000, 4_000];
+fn streamed_assistant_content_has_output<R>(content: &StreamedAssistantContent<R>) -> bool {
+    match content {
+        StreamedAssistantContent::Text(text) => !text.text.is_empty(),
+        StreamedAssistantContent::ToolCall { .. } => true,
+        _ => {
+            streamed_reasoning_text(content).is_some()
+                || streamed_provider_reasoning(content).is_some()
+        }
+    }
+}
+
+const PROVIDER_RETRY_INITIAL_DELAY_MS: u64 = 2_000;
+const PROVIDER_RETRY_MAX_DELAY_MS: u64 = 30_000;
+const PROVIDER_RETRY_CONTINUE_PROMPT: &str = "Go";
 
 fn retry_delay_ms(attempt: usize, message: &str) -> Option<u64> {
     if !is_retryable_provider_error(message) {
         return None;
     }
-    PROVIDER_RETRY_DELAYS_MS.get(attempt).copied()
+    Some(
+        PROVIDER_RETRY_INITIAL_DELAY_MS
+            .saturating_mul(1_u64 << attempt.min(4))
+            .min(PROVIDER_RETRY_MAX_DELAY_MS),
+    )
 }
 
 fn is_retryable_provider_error(message: &str) -> bool {
@@ -102,19 +120,16 @@ fn is_retryable_provider_error(message: &str) -> bool {
         return false;
     }
     [
-        " 408 ",
-        " 409 ",
-        " 429 ",
-        " 500 ",
-        " 502 ",
-        " 503 ",
-        " 504 ",
         "timeout",
         "timed out",
+        "deadline exceeded",
         "rate limit",
+        "rate_limit",
         "too many requests",
+        "too_many_requests",
         "overloaded",
         "overload",
+        "exhausted",
         "temporarily unavailable",
         "provider_unavailable",
         "service unavailable",
@@ -122,9 +137,16 @@ fn is_retryable_provider_error(message: &str) -> bool {
         "bad gateway",
         "connection lost",
         "connection reset",
+        "connection closed",
+        "temporary failure",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+        || lower
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|part| part.len() == 3)
+            .filter_map(|part| part.parse::<u16>().ok())
+            .any(|status| status == 408 || status == 429 || (500..=599).contains(&status))
 }
 
 fn is_non_retryable_provider_error(lower: &str) -> bool {
@@ -141,12 +163,16 @@ fn is_non_retryable_provider_error(lower: &str) -> bool {
         "invalid_request_error",
         "invalid api key",
         "unauthorized",
+        "forbidden",
+        "permission denied",
         "insufficient_quota",
-        "quota",
         "billing",
         "usage limit",
         "freeusagelimiterror",
         "gousagelimiterror",
+        "model not found",
+        "unsupported model",
+        "content policy",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -154,6 +180,19 @@ fn is_non_retryable_provider_error(lower: &str) -> bool {
 
 async fn sleep_for_retry(delay_ms: u64) {
     sleep(Duration::from_millis(delay_ms)).await;
+}
+
+fn preserve_retry_output(
+    history: &mut Vec<Message>,
+    prompt: &str,
+    tool_interactions: &mut Vec<Message>,
+    partial_text: &str,
+) {
+    history.push(Message::user(prompt));
+    history.append(tool_interactions);
+    if !partial_text.is_empty() {
+        history.push(Message::assistant(partial_text));
+    }
 }
 
 /// Spawn an isolated, single-turn, tool-less side-question run. The full result
@@ -526,8 +565,8 @@ where
     crate::extras::subagents::set_subagent_event_tx(event_tx.clone());
 
     let join = tokio::spawn(async move {
-        let retry_prompt = prompt.clone();
-        let retry_history: Vec<Message> = history.clone();
+        let mut retry_prompt = prompt.clone();
+        let mut retry_history: Vec<Message> = history.clone();
         let mut tool_interactions: Vec<Message> = Vec::new();
         let mut last_tool_name: Option<String> = None;
         let mut tool_names: HashMap<String, String> = HashMap::new();
@@ -537,6 +576,7 @@ where
         let mut response_reasoning: Vec<ProviderReasoning> = Vec::new();
         let mut retry_attempts = 0usize;
         let mut stream_had_output = false;
+        let mut partial_text = String::new();
 
         let mut provider_call_started = Instant::now();
         let mut stream = agent.stream_chat(prompt, history).await;
@@ -545,7 +585,7 @@ where
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
-                        stream_had_output = true;
+                        stream_had_output |= streamed_assistant_content_has_output(&content);
                         if let Some(reasoning) = streamed_provider_reasoning(&content) {
                             tool_interactions.push(assistant_message_with_reasoning(
                                 "",
@@ -560,6 +600,7 @@ where
 
                         match content {
                             StreamedAssistantContent::Text(text) => {
+                                partial_text.push_str(&text.text);
                                 let _ = event_tx
                                     .send(AgentEvent::Token(CompactString::from(text.text)))
                                     .await;
@@ -696,15 +737,26 @@ where
                     }
                     Err(e) => {
                         let message = e.to_string();
-                        if !stream_had_output
-                            && let Some(delay_ms) = retry_delay_ms(retry_attempts, &message)
-                        {
-                            retry_attempts += 1;
+                        if let Some(delay_ms) = retry_delay_ms(retry_attempts, &message) {
+                            retry_attempts = retry_attempts.saturating_add(1);
+                            let continuing = stream_had_output;
+                            if continuing {
+                                preserve_retry_output(
+                                    &mut retry_history,
+                                    &retry_prompt,
+                                    &mut tool_interactions,
+                                    &partial_text,
+                                );
+                                retry_prompt = PROVIDER_RETRY_CONTINUE_PROMPT.to_string();
+                            }
+                            partial_text.clear();
+                            stream_had_output = false;
                             let _ = event_tx
                                 .send(AgentEvent::Retry {
-                                    attempt: retry_attempts as u32,
+                                    attempt: retry_attempts.try_into().unwrap_or(u32::MAX),
                                     delay_ms,
                                     message: CompactString::new(message),
+                                    continuing,
                                 })
                                 .await;
                             sleep_for_retry(delay_ms).await;
@@ -729,6 +781,7 @@ where
 
             retry_attempts = 0;
             stream_had_output = false;
+            partial_text.clear();
             provider_call_started = Instant::now();
             stream =
                 continue_prompt_injector(&agent, &retry_prompt, &retry_history, &tool_interactions)
@@ -1232,11 +1285,15 @@ mod tests {
     #[cfg(feature = "subagents")]
     use super::{SubagentLimits, subagent_cutoff_prompt, subagent_invalid_tool_feedback};
     use super::{
-        convert_history, retry_delay_ms, streamed_provider_reasoning, streamed_reasoning_text,
+        convert_history, preserve_retry_output, retry_delay_ms,
+        streamed_assistant_content_has_output, streamed_provider_reasoning,
+        streamed_reasoning_text,
     };
     use crate::session::{MessageRole, ProviderReasoning, ProviderReasoningContent, Session};
     use rig::completion::Message;
-    use rig::completion::message::{AssistantContent, Reasoning, ReasoningContent, UserContent};
+    use rig::completion::message::{
+        AssistantContent, Reasoning, ReasoningContent, Text, UserContent,
+    };
     use rig::streaming::StreamedAssistantContent;
 
     #[cfg(feature = "subagents")]
@@ -1325,6 +1382,10 @@ mod tests {
         };
 
         assert!(streamed_reasoning_text(&content).is_none());
+        assert!(!streamed_assistant_content_has_output(&content));
+        assert!(!streamed_assistant_content_has_output(
+            &StreamedAssistantContent::<()>::Text(Text::new(""))
+        ));
     }
 
     #[test]
@@ -1443,14 +1504,39 @@ mod tests {
     fn retry_classification_retries_transient_provider_failures() {
         assert_eq!(
             retry_delay_ms(0, "Invalid status code 503 Service Unavailable"),
-            Some(1_000)
+            Some(2_000)
         );
         assert_eq!(
             retry_delay_ms(1, "rate limit: too many requests"),
+            Some(4_000)
+        );
+        assert_eq!(retry_delay_ms(2, "provider_unavailable"), Some(8_000));
+        assert_eq!(retry_delay_ms(4, "HTTP 599"), Some(30_000));
+        assert_eq!(retry_delay_ms(20, "resource_exhausted"), Some(30_000));
+        assert_eq!(
+            retry_delay_ms(
+                0,
+                "CompletionError: ProviderError: server_is_overloaded: Our servers are currently overloaded."
+            ),
             Some(2_000)
         );
-        assert_eq!(retry_delay_ms(2, "provider_unavailable"), Some(4_000));
-        assert_eq!(retry_delay_ms(3, "provider_unavailable"), None);
+    }
+
+    #[test]
+    fn retry_history_keeps_every_partial_attempt() {
+        let mut history = Vec::new();
+        let mut interactions = Vec::new();
+        preserve_retry_output(&mut history, "original", &mut interactions, "first half");
+        preserve_retry_output(&mut history, "Go", &mut interactions, "second half");
+
+        assert!(matches!(&history[0], Message::User { content } if
+            matches!(content.first(), UserContent::Text(text) if text.text == "original")));
+        assert!(matches!(&history[1], Message::Assistant { content, .. } if
+            matches!(content.first(), AssistantContent::Text(text) if text.text == "first half")));
+        assert!(matches!(&history[2], Message::User { content } if
+            matches!(content.first(), UserContent::Text(text) if text.text == "Go")));
+        assert!(matches!(&history[3], Message::Assistant { content, .. } if
+            matches!(content.first(), AssistantContent::Text(text) if text.text == "second half")));
     }
 
     #[test]

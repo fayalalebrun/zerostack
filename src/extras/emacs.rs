@@ -3068,7 +3068,28 @@ mod imp {
                     attempt,
                     delay_ms,
                     message,
+                    continuing,
                 } => {
+                    if continuing {
+                        let mut session = server.session.lock().await;
+                        session.add_partial_assistant_output(&response_buf, Vec::new());
+                        session.add_message(MessageRole::User, "Go");
+                        if !server.cli.no_session {
+                            crate::session::storage::save_session(&session)?;
+                        }
+                        drop(session);
+                        response_buf.clear();
+                        response_start_line = None;
+                        reasoning_buf.clear();
+                        reasoning_start_line = None;
+                        server
+                            .append_lines(
+                                "retry-continuation-render",
+                                turn,
+                                vec![WireLine::new("> Go", "zs-user")],
+                            )
+                            .await;
+                    }
                     let text = format!(
                         "retrying provider request #{} in {:.1}s: {}",
                         attempt,
