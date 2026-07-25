@@ -120,6 +120,8 @@ mod imp {
         compacted: bool,
         messages: usize,
         saved_tokens: u64,
+        tokens: u64,
+        context_window: u64,
         message: String,
     }
 
@@ -2048,7 +2050,10 @@ mod imp {
         }
         mark_attention(server, "after compaction").await;
         server
-            .broadcast_event("compact-done", format!(" :turn {}", turn))
+            .broadcast_event(
+                "compact-done",
+                format!(" :turn {}{}", turn, compact_outcome_fields(&outcome)),
+            )
             .await;
 
         send_ok(out, request_arg(cmd), compact_outcome_fields(&outcome)).await;
@@ -2057,10 +2062,12 @@ mod imp {
 
     fn compact_outcome_fields(outcome: &CompactionOutcome) -> String {
         format!(
-            " :compacted {} :messages {} :saved-tokens {} :message {}",
+            " :compacted {} :messages {} :saved-tokens {} :tokens {} :context-window {} :message {}",
             bool_atom(outcome.compacted),
             outcome.messages,
             outcome.saved_tokens,
+            outcome.tokens,
+            outcome.context_window,
             sexp_quote(&outcome.message),
         )
     }
@@ -2078,10 +2085,13 @@ mod imp {
             should_auto_compact(&session, &server.cfg, None)
         };
         if !should_compact || server.cli.no_session {
+            let session = server.session.lock().await;
             return Ok(CompactionOutcome {
                 compacted: false,
                 messages: 0,
                 saved_tokens: 0,
+                tokens: session.effective_context_tokens(),
+                context_window: session.context_window,
                 message: "auto-compact not needed".to_string(),
             });
         }
@@ -2133,6 +2143,8 @@ mod imp {
                     compacted: false,
                     messages: 0,
                     saved_tokens: 0,
+                    tokens: session.effective_context_tokens(),
+                    context_window: session.context_window,
                     message: "nothing to compress (entire context is recent)".to_string(),
                 });
             }
@@ -2155,7 +2167,7 @@ mod imp {
             .compress_messages(&model, &messages, previous_summary.as_deref(), instructions)
             .await?;
 
-        {
+        let (tokens, context_window) = {
             let mut session = server.session.lock().await;
             if let Some(call) = compression.provider_call {
                 session.add_compaction_provider_call(call.call_index, call.usage, call.duration_ms);
@@ -2167,13 +2179,16 @@ mod imp {
             if !server.cli.no_session {
                 crate::session::storage::save_session(&session)?;
             }
-        }
+            (session.effective_context_tokens(), session.context_window)
+        };
         server.update_meta_from_session().await;
 
         Ok(CompactionOutcome {
             compacted: true,
             messages: cut_idx,
             saved_tokens,
+            tokens,
+            context_window,
             message: format!("compressed {cut_idx} messages (saved ~{saved_tokens} tokens)"),
         })
     }
@@ -2761,6 +2776,7 @@ mod imp {
         let mut reasoning_buf = String::new();
         let mut reasoning_start_line: Option<usize> = None;
         let mut retried_after_mid_turn_compact = false;
+        let mut continued_after_auto_compact = false;
 
         while let Some(event) = runner.event_rx.recv().await {
             match event {
@@ -3288,32 +3304,31 @@ mod imp {
                             usage.reasoning_tokens,
                         )
                     };
-                    if let Err(e) = maybe_auto_compact_session(&server, turn).await {
-                        server
-                            .broadcast_event(
-                                "error",
-                                format!(
-                                    " :turn {} :message {}",
-                                    turn,
-                                    sexp_quote(&format!("auto-compact error: {e}"))
-                                ),
-                            )
-                            .await;
-                    }
+                    let auto_compacted = if continued_after_auto_compact {
+                        false
+                    } else {
+                        match maybe_auto_compact_session(&server, turn).await {
+                            Ok(outcome) => outcome.compacted,
+                            Err(e) => {
+                                server
+                                    .broadcast_event(
+                                        "error",
+                                        format!(
+                                            " :turn {} :message {}",
+                                            turn,
+                                            sexp_quote(&format!("auto-compact error: {e}"))
+                                        ),
+                                    )
+                                    .await;
+                                false
+                            }
+                        }
+                    };
                     if !server.cli.no_session {
                         let session = server.session.lock().await;
                         crate::session::storage::save_session(&session)?;
                     }
                     server.update_meta_from_session().await;
-                    server
-                        .broadcast_event(
-                            "done",
-                            format!(
-                                " :turn {} :input-tokens {} :output-tokens {} :reasoning-tokens {} :tokens {} :context-window {}",
-                                turn, billable_input_tokens, billable_output_tokens, billable_reasoning_tokens, tokens, context_window,
-                            ),
-                        )
-                        .await;
                     if !latex_items.is_empty() {
                         server
                             .broadcast_event(
@@ -3326,6 +3341,37 @@ mod imp {
                             )
                             .await;
                     }
+                    if auto_compacted {
+                        continued_after_auto_compact = true;
+                        retried_after_mid_turn_compact = true;
+                        response_buf.clear();
+                        response_start_line = None;
+                        reasoning_buf.clear();
+                        reasoning_start_line = None;
+                        let history = {
+                            let session = server.session.lock().await;
+                            assistant_index = session.messages.len();
+                            convert_history(&session)
+                        };
+                        runner = agent
+                            .clone()
+                            .spawn_runner(mid_turn_continue_prompt(), history);
+                        {
+                            let mut mutable = server.mutable.lock().await;
+                            mutable.abort_handle = Some(runner.abort_handle.clone());
+                            mutable.active_response = Some((turn, String::new()));
+                        }
+                        continue;
+                    }
+                    server
+                        .broadcast_event(
+                            "done",
+                            format!(
+                                " :turn {} :input-tokens {} :output-tokens {} :reasoning-tokens {} :tokens {} :context-window {}",
+                                turn, billable_input_tokens, billable_output_tokens, billable_reasoning_tokens, tokens, context_window,
+                            ),
+                        )
+                        .await;
                     return Ok(Some(response.to_string()));
                 }
                 AgentEvent::Error { message, reasoning } => {
@@ -5553,11 +5599,13 @@ mod imp {
                 compacted: true,
                 messages: 3,
                 saved_tokens: 1200,
+                tokens: 4200,
+                context_window: 128000,
                 message: "compressed \"old\" context".to_string(),
             };
             assert_eq!(
                 compact_outcome_fields(&outcome),
-                " :compacted t :messages 3 :saved-tokens 1200 :message \"compressed \\\"old\\\" context\"",
+                " :compacted t :messages 3 :saved-tokens 1200 :tokens 4200 :context-window 128000 :message \"compressed \\\"old\\\" context\"",
             );
         }
 

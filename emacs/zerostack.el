@@ -2585,7 +2585,10 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
      (zerostack--set-status "compacting...")
      (zerostack--set-thinking t))
     ((or 'compact-done 'compact-finished)
-     (if (eq (plist-get plist :mid-turn) t)
+     (zerostack--update-provider-model plist)
+     (if (or (eq (plist-get plist :mid-turn) t)
+             (and (eq (plist-get plist :auto) t)
+                  (eq (plist-get plist :compacted) t)))
          (progn
            (zerostack--set-thinking t)
            (zerostack--set-status "continuing..."))

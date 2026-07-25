@@ -1126,6 +1126,17 @@
    (should zerostack--thinking)
    (should (equal zerostack--status "continuing..."))))
 
+(ert-deftest zerostack-test-auto-compact-updates-tokens-and-keeps-buffer-active ()
+  (zerostack-test--with-buffer
+   (setq zerostack--tokens 900
+         zerostack--context-window 1000)
+   (zerostack--handle-event
+    '(:type compact-done :auto t :compacted t :tokens 250 :context-window 1000))
+   (should (= zerostack--tokens 250))
+   (should (= zerostack--context-window 1000))
+   (should zerostack--thinking)
+   (should (equal zerostack--status "continuing..."))))
+
 (ert-deftest zerostack-test-stream-output-restores-thinking-after-stale-idle ()
   (zerostack-test--with-buffer
    (zerostack--set-thinking nil)

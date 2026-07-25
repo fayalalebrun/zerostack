@@ -255,6 +255,10 @@ The socket protocol is one escaped S-expression per line. Core client commands:
 | `(list-sessions :limit 50)` | Return live native Emacs sessions. |
 | `(dismiss-attention :session "...")` | Remove a session from the board Needs attention section. Defaults to the current session when `:session` is omitted. |
 
+Compaction completion events include the post-compaction `:tokens` and
+`:context-window` values. End-of-turn automatic compaction immediately continues
+the same agent turn from the compacted session instead of entering the idle state.
+
 When a loop is active, one-off `(prompt ...)` commands are rejected until the loop
 is stopped. Loop events are broadcast as ordinary protocol events:
 `loop-started` when the loop is accepted, `loop-iteration` before each agent
