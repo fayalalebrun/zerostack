@@ -2027,6 +2027,28 @@
      (should (member '(tex-fold-mode 1) calls))
      (should (member 'tex-fold-buffer calls)))))
 
+(ert-deftest zerostack-test-latex-preview-exposes-render-error ()
+  (zerostack-test--with-buffer
+   (zerostack--replace-lines
+    0 '((:text "< $broken$" :face zs-normal)))
+   (let ((item '(:id "broken-latex"
+                     :display nil
+                     :source "broken"
+                     :line-start 0
+                     :col-start 2
+                     :line-end 0
+                     :col-end 10
+                     :artifact (:kind latex-source :path "/tmp/broken.tex")
+                     :svg-artifact nil
+                     :error "latex exited with status 1")))
+     (zerostack--handle-latex-preview-ready (list item))
+     (let ((overlay (cl-find-if (lambda (it)
+                                  (overlay-get it 'zerostack-latex))
+                                (overlays-in (point-min) (point-max)))))
+       (should overlay)
+       (should (string-match-p "render failed: latex exited with status 1"
+                               (overlay-get overlay 'help-echo)))))))
+
 (ert-deftest zerostack-test-latex-preview-prefers-rust-svg-artifact ()
   (zerostack-test--with-buffer
    (let ((item '(:id "svg-latex"

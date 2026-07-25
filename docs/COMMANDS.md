@@ -336,10 +336,13 @@ best-effort via runtime directory lifetime and stale session sweeping.
 
 Assistant renders may include LaTeX metadata for inline SVG display. Zerostack
 recognizes inline `$...$` and `\(...\)` math plus display `$$...$$` and
-`\[...\]` math. It writes ephemeral `.tex` source artifacts, renders them to
-ephemeral SVG artifacts with `latex` and `dvisvgm` when those tools are
-available, marks the rendered line ranges, and emits `latex-preview-ready` after
-`done` so the Emacs client can apply stable inline overlays.
+`\[...\]` math. Detection runs on sanitized Markdown before layout, excludes
+inline and fenced code, and preserves math as literal text while Markdown is
+rendered and wrapped. Zerostack writes ephemeral `.tex` source artifacts,
+renders them to ephemeral SVG artifacts with `latex` and `dvisvgm` when those
+tools are available, marks the rendered line ranges, and emits
+`latex-preview-ready` after `done` so the Emacs client can apply stable inline
+overlays.
 
 ```lisp
 (:text "< Inline $x^2$"
@@ -364,7 +367,8 @@ available, marks the rendered line ranges, and emits `latex-preview-ready` after
                           :bytes 1872
                           :preview "<?xml version='1.0' ..."
                           :ephemeral t
-                          :expires process-exit))))
+                          :expires process-exit)
+           :error nil)))
 
 (event :type latex-preview-ready
        :turn 3
@@ -374,10 +378,12 @@ available, marks the rendered line ranges, and emits `latex-preview-ready` after
 The intended Emacs behavior is: insert the pre-rendered markdown lines, collect
 `:latex` items, wait for `latex-preview-ready`, then create overlays for those
 line/column ranges. The client prefers `:svg-artifact` and displays it strictly
-in place via an image overlay. If SVG rendering is missing or unavailable, it can
-fall back to the older off-screen AUCTeX/`TeX-fold-mode` string display. Source
-`.tex` artifact buffers are not displayed automatically; `/latex` or artifact
-actions open them explicitly.
+in place via an image overlay. If SVG rendering is missing or unavailable,
+`:svg-artifact` is nil and `:error` contains the command, timeout, or compilation
+failure; the client exposes that error in the overlay help and can fall back to
+the older off-screen AUCTeX/`TeX-fold-mode` string display. Source `.tex`
+artifact buffers are not displayed automatically; `/latex` or artifact actions
+open them explicitly.
 
 ## Native Emacs Board Snapshot
 

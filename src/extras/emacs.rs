@@ -202,6 +202,7 @@ mod imp {
         display: bool,
         artifact: ArtifactInfo,
         svg_artifact: Option<ArtifactInfo>,
+        error: Option<String>,
         line_start: usize,
         col_start: usize,
         line_end: usize,
@@ -299,6 +300,14 @@ mod imp {
         col_start: usize,
         line_end: usize,
         col_end: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RawLatexSpan {
+        source: String,
+        display: bool,
+        byte_start: usize,
+        byte_end: usize,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3251,7 +3260,8 @@ mod imp {
                         assistant_index,
                         MessageRole::Assistant,
                     );
-                    let latex_items = attach_latex_metadata(&server, turn, start, &mut lines).await;
+                    let latex_items =
+                        attach_latex_metadata(&server, turn, start, &response, &mut lines).await;
                     server
                         .send_render_event("assistant-render", turn, start, lines)
                         .await;
@@ -3975,7 +3985,8 @@ mod imp {
         let options = MdOptions::ENABLE_STRIKETHROUGH
             | MdOptions::ENABLE_TABLES
             | MdOptions::ENABLE_TASKLISTS;
-        let protected = protect_latex_delimiters(text);
+        let (protected, latex_segments) = protect_latex_segments(text, options);
+        let protected = protect_latex_delimiters(&protected);
         let parser = MdParser::new_ext(&protected, options);
         let mut out = Vec::new();
         let mut line = SpanLine::new("zs-normal");
@@ -4105,7 +4116,8 @@ mod imp {
                     _ => {}
                 },
                 MdEvent::Text(value) => {
-                    let value = restore_latex_delimiters(&value);
+                    let value =
+                        restore_latex_segments(&restore_latex_delimiters(&value), &latex_segments);
                     if let Some((_, alt)) = image.as_mut() {
                         alt.push_str(&value);
                     } else if in_table {
@@ -4122,7 +4134,8 @@ mod imp {
                     }
                 }
                 MdEvent::Code(value) => {
-                    let value = restore_latex_delimiters(&value);
+                    let value =
+                        restore_latex_segments(&restore_latex_delimiters(&value), &latex_segments);
                     if in_table {
                         if !table_cell.is_empty() {
                             table_cell.push(' ');
@@ -4151,6 +4164,31 @@ mod imp {
         }
         line.flush(&mut out, cols);
         out
+    }
+
+    fn protect_latex_segments(text: &str, options: MdOptions) -> (String, Vec<String>) {
+        let spans = find_raw_latex_spans(text, options);
+        let mut protected = String::with_capacity(text.len());
+        let mut segments = Vec::with_capacity(spans.len());
+        let mut pos = 0;
+        for (index, span) in spans.into_iter().enumerate() {
+            protected.push_str(&text[pos..span.byte_start]);
+            protected.push('\u{e100}');
+            protected.push_str(&index.to_string());
+            protected.push('\u{e101}');
+            segments.push(text[span.byte_start..span.byte_end].to_string());
+            pos = span.byte_end;
+        }
+        protected.push_str(&text[pos..]);
+        (protected, segments)
+    }
+
+    fn restore_latex_segments(text: &str, segments: &[String]) -> String {
+        let mut restored = text.to_string();
+        for (index, segment) in segments.iter().enumerate() {
+            restored = restored.replace(&format!("\u{e100}{index}\u{e101}"), segment);
+        }
+        restored
     }
 
     fn protect_latex_delimiters(text: &str) -> String {
@@ -4473,9 +4511,10 @@ mod imp {
         server: &Arc<Server>,
         turn: u64,
         replace_from: usize,
+        markdown: &str,
         lines: &mut [WireLine],
     ) -> Vec<LatexInfo> {
-        let spans = find_latex_spans(lines);
+        let spans = map_raw_latex_spans(markdown, lines);
         let mut latex_items = Vec::new();
 
         for (idx, span) in spans.into_iter().enumerate() {
@@ -4498,13 +4537,15 @@ mod imp {
                     continue;
                 }
             };
-            let svg_artifact = render_latex_svg_artifact(server, turn, &filename, idx + 1).await;
+            let (svg_artifact, error) =
+                render_latex_svg_artifact(server, turn, &filename, idx + 1).await;
             let latex = LatexInfo {
                 id,
                 source: span.source,
                 display: span.display,
                 artifact,
                 svg_artifact,
+                error,
                 line_start: replace_from.saturating_add(span.line_start),
                 col_start: span.col_start,
                 line_end: replace_from.saturating_add(span.line_end),
@@ -4524,12 +4565,13 @@ mod imp {
         turn: u64,
         tex_filename: &str,
         index: usize,
-    ) -> Option<ArtifactInfo> {
+    ) -> (Option<ArtifactInfo>, Option<String>) {
         match render_latex_svg_artifact_inner(server, turn, tex_filename, index).await {
-            Ok(artifact) => Some(artifact),
+            Ok(artifact) => (Some(artifact), None),
             Err(e) => {
-                tracing::warn!("failed to render Emacs LaTeX SVG artifact: {e}");
-                None
+                let error = format!("{e:#}");
+                tracing::warn!("failed to render Emacs LaTeX SVG artifact: {error}");
+                (None, Some(error))
             }
         }
     }
@@ -4570,6 +4612,14 @@ mod imp {
 
     async fn run_latex_command(dir: &Path, tex_filename: &str) -> anyhow::Result<()> {
         let command = std::env::var("ZEROSTACK_LATEX").unwrap_or_else(|_| "latex".to_string());
+        run_latex_command_with(dir, tex_filename, &command).await
+    }
+
+    async fn run_latex_command_with(
+        dir: &Path,
+        tex_filename: &str,
+        command: &str,
+    ) -> anyhow::Result<()> {
         let output = timeout(
             Duration::from_secs(8),
             ProcessCommand::new(command)
@@ -4596,6 +4646,15 @@ mod imp {
         svg_filename: &str,
     ) -> anyhow::Result<()> {
         let command = std::env::var("ZEROSTACK_DVISVGM").unwrap_or_else(|_| "dvisvgm".to_string());
+        run_dvisvgm_command_with(dir, dvi_filename, svg_filename, &command).await
+    }
+
+    async fn run_dvisvgm_command_with(
+        dir: &Path,
+        dvi_filename: &str,
+        svg_filename: &str,
+        command: &str,
+    ) -> anyhow::Result<()> {
         let output_arg = format!("--output={svg_filename}");
         let output = timeout(
             Duration::from_secs(8),
@@ -4623,111 +4682,189 @@ mod imp {
         Ok(())
     }
 
-    fn find_latex_spans(lines: &[WireLine]) -> Vec<LocatedLatexSpan> {
-        let mut spans = Vec::new();
-        let mut display_start: Option<(usize, usize, String)> = None;
+    fn map_raw_latex_spans(markdown: &str, lines: &[WireLine]) -> Vec<LocatedLatexSpan> {
+        let options = MdOptions::ENABLE_STRIKETHROUGH
+            | MdOptions::ENABLE_TABLES
+            | MdOptions::ENABLE_TASKLISTS;
+        let raw_spans = find_raw_latex_spans(&sanitize_output(markdown), options);
+        let rendered_spans = find_latex_spans(lines);
+        let mut rendered_index = 0;
+        raw_spans
+            .into_iter()
+            .filter_map(|raw| {
+                let offset = rendered_spans[rendered_index..].iter().position(|span| {
+                    span.display == raw.display
+                        && normalized_latex_source(&span.source)
+                            == normalized_latex_source(&raw.source)
+                })?;
+                rendered_index += offset + 1;
+                Some(rendered_spans[rendered_index - 1].clone())
+            })
+            .collect()
+    }
 
-        for (line_idx, line) in lines.iter().enumerate() {
-            if matches!(line.face, "zs-code" | "zs-code-block") {
-                continue;
-            }
-            let text = line.text.as_str();
-            let mut pos = 0;
-
-            if let Some((start_line, start_col, mut source)) = display_start.take() {
-                if let Some(end) = find_unescaped(text, "$$", pos) {
-                    if !source.is_empty() {
-                        source.push('\n');
+    fn find_raw_latex_spans(text: &str, options: MdOptions) -> Vec<RawLatexSpan> {
+        let mut code_ranges = Vec::new();
+        let mut code_block_start = None;
+        for (event, range) in MdParser::new_ext(text, options).into_offset_iter() {
+            match event {
+                MdEvent::Start(MdTag::CodeBlock(_)) => code_block_start = Some(range.start),
+                MdEvent::End(MdTagEnd::CodeBlock) => {
+                    if let Some(start) = code_block_start.take() {
+                        code_ranges.push((start, range.end));
                     }
-                    source.push_str(&text[..end]);
-                    push_latex_span(
-                        &mut spans,
-                        source,
-                        true,
-                        start_line,
-                        start_col,
-                        line_idx,
-                        byte_to_char_idx(text, end + 2),
-                    );
-                    pos = end + 2;
-                } else {
-                    if !source.is_empty() {
-                        source.push('\n');
-                    }
-                    source.push_str(text);
-                    display_start = Some((start_line, start_col, source));
-                    continue;
                 }
-            }
-
-            while pos < text.len() {
-                let next_display = find_unescaped(text, "$$", pos);
-                let next_inline = find_inline_dollar(text, pos);
-
-                match (next_display, next_inline) {
-                    (Some(display), Some(inline)) if inline < display => {
-                        if let Some(end) = find_inline_dollar(text, inline + 1) {
-                            push_latex_span(
-                                &mut spans,
-                                text[inline + 1..end].to_string(),
-                                false,
-                                line_idx,
-                                byte_to_char_idx(text, inline),
-                                line_idx,
-                                byte_to_char_idx(text, end + 1),
-                            );
-                            pos = end + 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    (Some(display), _) => {
-                        let source_start = display + 2;
-                        if let Some(end) = find_unescaped(text, "$$", source_start) {
-                            push_latex_span(
-                                &mut spans,
-                                text[source_start..end].to_string(),
-                                true,
-                                line_idx,
-                                byte_to_char_idx(text, display),
-                                line_idx,
-                                byte_to_char_idx(text, end + 2),
-                            );
-                            pos = end + 2;
-                        } else {
-                            display_start = Some((
-                                line_idx,
-                                byte_to_char_idx(text, display),
-                                text[source_start..].to_string(),
-                            ));
-                            break;
-                        }
-                    }
-                    (None, Some(inline)) => {
-                        if let Some(end) = find_inline_dollar(text, inline + 1) {
-                            push_latex_span(
-                                &mut spans,
-                                text[inline + 1..end].to_string(),
-                                false,
-                                line_idx,
-                                byte_to_char_idx(text, inline),
-                                line_idx,
-                                byte_to_char_idx(text, end + 1),
-                            );
-                            pos = end + 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    (None, None) => break,
-                }
+                MdEvent::Code(_) => code_ranges.push((range.start, range.end)),
+                _ => {}
             }
         }
+        if let Some(start) = code_block_start {
+            code_ranges.push((start, text.len()));
+        }
+        code_ranges.sort_unstable();
 
+        let mut spans = Vec::new();
+        let mut pos = 0;
+        for (start, end) in code_ranges {
+            if pos < start {
+                find_raw_latex_spans_in_range(text, pos, start, &mut spans);
+            }
+            pos = pos.max(end);
+        }
+        if pos < text.len() {
+            find_raw_latex_spans_in_range(text, pos, text.len(), &mut spans);
+        }
+        spans
+    }
+
+    fn find_raw_latex_spans_in_range(
+        text: &str,
+        start: usize,
+        end: usize,
+        spans: &mut Vec<RawLatexSpan>,
+    ) {
+        let mut pos = start;
+        while pos < end {
+            let inline_dollar = find_inline_dollar(text, pos).filter(|at| *at < end);
+            let display_dollar = find_unescaped(text, "$$", pos).filter(|at| *at < end);
+            let inline_slash = find_unescaped(text, r"\(", pos).filter(|at| *at < end);
+            let display_slash = find_unescaped(text, r"\[", pos).filter(|at| *at < end);
+            let Some((open, close, display)) = [
+                inline_dollar.map(|at| (at, "$", false)),
+                display_dollar.map(|at| (at, "$$", true)),
+                inline_slash.map(|at| (at, r"\)", false)),
+                display_slash.map(|at| (at, r"\]", true)),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(at, delimiter, _)| (*at, usize::MAX - delimiter.len())) else {
+                break;
+            };
+            let source_start = open + if close == "$" { 1 } else { 2 };
+            let close_at = if close == "$" {
+                find_inline_dollar(text, source_start)
+            } else {
+                find_unescaped(text, close, source_start)
+            };
+            let Some(close_at) = close_at.filter(|at| *at < end) else {
+                pos = source_start;
+                continue;
+            };
+            let source = text[source_start..close_at].trim();
+            if !source.is_empty() {
+                spans.push(RawLatexSpan {
+                    source: source.to_string(),
+                    display,
+                    byte_start: open,
+                    byte_end: close_at + close.len(),
+                });
+            }
+            pos = close_at + close.len();
+        }
+    }
+
+    fn find_latex_spans(lines: &[WireLine]) -> Vec<LocatedLatexSpan> {
+        let mut spans = Vec::new();
+        find_dollar_latex_spans(lines, &mut spans);
         find_backslash_latex_spans(lines, &mut spans);
         spans.retain(|span| !latex_span_overlaps_code(lines, span));
         spans.sort_by_key(|span| (span.line_start, span.col_start));
         spans
+    }
+
+    fn find_dollar_latex_spans(lines: &[WireLine], spans: &mut Vec<LocatedLatexSpan>) {
+        let mut open: Option<(usize, usize, String, &'static str, bool)> = None;
+        for (line_idx, line) in lines.iter().enumerate() {
+            if matches!(line.face, "zs-code" | "zs-code-block") {
+                open = None;
+                continue;
+            }
+            let text = line.text.as_str();
+            let mut pos = 0;
+            if let Some((start_line, start_col, mut source, close, display)) = open.take() {
+                let end = if display {
+                    find_unescaped(text, close, 0)
+                } else {
+                    find_inline_dollar(text, 0)
+                };
+                if let Some(end) = end {
+                    source.push('\n');
+                    source.push_str(&text[..end]);
+                    push_latex_span(
+                        spans,
+                        source,
+                        display,
+                        start_line,
+                        start_col,
+                        line_idx,
+                        byte_to_char_idx(text, end + close.len()),
+                    );
+                    pos = end + close.len();
+                } else {
+                    source.push('\n');
+                    source.push_str(text);
+                    open = Some((start_line, start_col, source, close, display));
+                    continue;
+                }
+            }
+            while pos < text.len() {
+                let inline = find_inline_dollar(text, pos);
+                let display = find_unescaped(text, "$$", pos);
+                let (start, close, is_display) = match (inline, display) {
+                    (Some(a), Some(b)) if a < b => (a, "$", false),
+                    (_, Some(b)) => (b, "$$", true),
+                    (Some(a), None) => (a, "$", false),
+                    (None, None) => break,
+                };
+                let source_start = start + close.len();
+                let end = if is_display {
+                    find_unescaped(text, close, source_start)
+                } else {
+                    find_inline_dollar(text, source_start)
+                };
+                if let Some(end) = end {
+                    push_latex_span(
+                        spans,
+                        text[source_start..end].to_string(),
+                        is_display,
+                        line_idx,
+                        byte_to_char_idx(text, start),
+                        line_idx,
+                        byte_to_char_idx(text, end + close.len()),
+                    );
+                    pos = end + close.len();
+                } else {
+                    open = Some((
+                        line_idx,
+                        byte_to_char_idx(text, start),
+                        text[source_start..].to_string(),
+                        close,
+                        is_display,
+                    ));
+                    break;
+                }
+            }
+        }
     }
 
     fn latex_span_overlaps_code(lines: &[WireLine], span: &LocatedLatexSpan) -> bool {
@@ -4890,6 +5027,10 @@ mod imp {
 
     fn byte_to_char_idx(text: &str, byte_idx: usize) -> usize {
         text[..byte_idx].chars().count()
+    }
+
+    fn normalized_latex_source(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     fn latex_document(source: &str, display: bool) -> String {
@@ -5304,8 +5445,13 @@ mod imp {
             .as_ref()
             .map(|artifact| artifact_to_sexp(artifact))
             .unwrap_or_else(|| "nil".to_string());
+        let error = latex
+            .error
+            .as_deref()
+            .map(sexp_quote)
+            .unwrap_or_else(|| "nil".to_string());
         format!(
-            "(:id {} :display {} :source {} :line-start {} :col-start {} :line-end {} :col-end {} :artifact {} :svg-artifact {})",
+            "(:id {} :display {} :source {} :line-start {} :col-start {} :line-end {} :col-end {} :artifact {} :svg-artifact {} :error {})",
             sexp_quote(&latex.id),
             bool_atom(latex.display),
             sexp_quote(&latex.source),
@@ -5315,6 +5461,7 @@ mod imp {
             latex.col_end,
             artifact_to_sexp(&latex.artifact),
             svg_artifact,
+            error,
         )
     }
 
@@ -6146,6 +6293,7 @@ mod imp {
                 display: false,
                 artifact,
                 svg_artifact: Some(svg_artifact),
+                error: None,
                 line_start: 42,
                 col_start: 9,
                 line_end: 42,
@@ -6163,6 +6311,113 @@ mod imp {
             assert!(latex_sexp.contains(":artifact (:kind latex-source"));
             assert!(latex_sexp.contains(":svg-artifact (:kind latex-svg"));
             assert!(latex_sexp.contains(":mime \"image/svg+xml\""));
+            assert!(latex_sexp.contains(":error nil"));
+        }
+
+        #[test]
+        fn raw_latex_detection_handles_all_delimiters_and_skips_code() {
+            let options = MdOptions::ENABLE_STRIKETHROUGH
+                | MdOptions::ENABLE_TABLES
+                | MdOptions::ENABLE_TASKLISTS;
+            let text =
+                "`$code$` $inline$ $$display$$ \\(paren\\) \\[bracket\\]\n```tex\n$also_code$\n```";
+            let spans = find_raw_latex_spans(text, options);
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| (span.source.as_str(), span.display))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("inline", false),
+                    ("display", true),
+                    ("paren", false),
+                    ("bracket", true),
+                ]
+            );
+        }
+
+        #[test]
+        fn wrapped_inline_dollar_math_survives_markdown_rendering() {
+            let markdown = "prefix words that fill the line $a + b = c + d$ suffix";
+            let lines = render_assistant_lines(markdown, 24, false);
+            let spans = map_raw_latex_spans(markdown, &lines);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(normalized_latex_source(&spans[0].source), "a + b = c + d");
+            assert!(!spans[0].display);
+            assert!(spans[0].line_start < spans[0].line_end);
+        }
+
+        #[test]
+        fn multiline_product_display_maps_to_rendered_lines() {
+            let markdown = "$$\n\\prod_{k=1}^{n}\\left(1+\\frac{x}{k}\\right)\n=\n\\frac{\\Gamma(n+x+1)}\n     {\\Gamma(1+x)\\Gamma(n+1)}\n$$";
+            let lines = render_assistant_lines(markdown, 80, false);
+            let spans = map_raw_latex_spans(markdown, &lines);
+            assert_eq!(spans.len(), 1);
+            assert!(spans[0].display);
+        }
+
+        #[test]
+        fn multiline_and_markdown_sensitive_latex_survive_rendering() {
+            let lines = render_assistant_lines(
+                "Before $$\na [link](target) + b\n$$ and \\(x * y\\)",
+                80,
+                false,
+            );
+            let spans = find_latex_spans(&lines);
+            assert_eq!(spans.len(), 2);
+            assert_eq!(
+                normalized_latex_source(&spans[0].source),
+                "a [link](target) + b"
+            );
+            assert!(spans[0].display);
+            assert_eq!(normalized_latex_source(&spans[1].source), "x * y");
+            assert!(!spans[1].display);
+        }
+
+        #[tokio::test]
+        async fn latex_command_errors_report_missing_binary_and_compilation_failure() {
+            let dir = std::env::temp_dir();
+            let missing = run_latex_command_with(
+                &dir,
+                "missing.tex",
+                "/definitely-not-a-zerostack-latex-binary",
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{missing:#}").contains("run latex"));
+
+            let failed = run_latex_command_with(&dir, "invalid.tex", "false")
+                .await
+                .unwrap_err();
+            assert!(failed.to_string().contains("latex exited with"));
+
+            let conversion = run_dvisvgm_command_with(&dir, "invalid.dvi", "invalid.svg", "false")
+                .await
+                .unwrap_err();
+            assert!(conversion.to_string().contains("dvisvgm exited with"));
+        }
+
+        #[test]
+        fn latex_render_error_is_serialized() {
+            let latex = LatexInfo {
+                id: "latex-1".to_string(),
+                source: "broken".to_string(),
+                display: true,
+                artifact: ArtifactInfo {
+                    kind: "latex-source",
+                    path: PathBuf::from("/tmp/broken.tex"),
+                    mime: "text/x-tex; charset=utf-8",
+                    bytes: 1,
+                    preview: String::new(),
+                },
+                svg_artifact: None,
+                error: Some("latex exited with status 1".to_string()),
+                line_start: 1,
+                col_start: 0,
+                line_end: 1,
+                col_end: 8,
+            };
+            assert!(latex_to_sexp(&latex).contains(":error \"latex exited with status 1\""));
         }
 
         #[test]

@@ -3015,9 +3015,12 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
         (overlay-put overlay 'face 'zerostack-latex-face)
         (overlay-put overlay 'mouse-face 'highlight)
         (overlay-put overlay 'help-echo
-                     (format "LaTeX %s: %s"
-                             (plist-get item :id)
-                             (plist-get artifact :path)))
+                     (if-let ((error (plist-get item :error)))
+                         (format "LaTeX %s render failed: %s"
+                                 (plist-get item :id) error)
+                       (format "LaTeX %s: %s"
+                               (plist-get item :id)
+                               (plist-get artifact :path))))
         (overlay-put overlay 'keymap zerostack-artifact-map)
         (overlay-put overlay 'follow-link t)
         (overlay-put overlay 'zerostack-artifact artifact)
