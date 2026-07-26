@@ -2112,13 +2112,18 @@ mod imp {
         Ok(outcome)
     }
 
+    fn continues_after_auto_compact(outcome: &CompactionOutcome) -> bool {
+        outcome.compacted
+    }
+
     async fn finish_auto_compact(
         server: &Arc<Server>,
         turn: u64,
         outcome: &CompactionOutcome,
         extra_fields: &str,
     ) {
-        if outcome.compacted {
+        if continues_after_auto_compact(outcome) {
+            clear_session_attention(server).await;
             let cols = server.mutable.lock().await.cols;
             let lines = render_session_lines(server, cols).await;
             server
@@ -3318,7 +3323,7 @@ mod imp {
                         false
                     } else {
                         match maybe_auto_compact_session(&server, turn).await {
-                            Ok(outcome) => outcome.compacted,
+                            Ok(outcome) => continues_after_auto_compact(&outcome),
                             Err(e) => {
                                 server
                                     .broadcast_event(
@@ -5959,6 +5964,22 @@ mod imp {
 
             assert!(prompt.contains("Continue the current turn"));
             assert!(prompt.contains("Do not repeat"));
+        }
+
+        #[test]
+        fn successful_auto_compaction_continues_without_attention() {
+            let mut outcome = CompactionOutcome {
+                compacted: true,
+                messages: 3,
+                saved_tokens: 100,
+                tokens: 900,
+                context_window: 1_000,
+                message: "compacted".to_string(),
+            };
+
+            assert!(continues_after_auto_compact(&outcome));
+            outcome.compacted = false;
+            assert!(!continues_after_auto_compact(&outcome));
         }
 
         #[test]
