@@ -6,7 +6,7 @@ use base64::Engine;
 use compact_str::CompactString;
 use futures::StreamExt;
 use rig::OneOrMany;
-use rig::agent::{Agent, MultiTurnStreamItem, StreamingResult};
+use rig::agent::{Agent, MultiTurnStreamItem, StreamingError, StreamingResult};
 #[cfg(feature = "subagents")]
 use rig::agent::{InvalidToolCallContext, InvalidToolCallHookAction, PromptHook};
 use rig::completion::message::{
@@ -16,7 +16,7 @@ use rig::completion::message::{
 use rig::completion::message::{
     AudioMediaType, Document, DocumentMediaType, DocumentSourceKind, ImageMediaType, MimeType,
 };
-use rig::completion::{CompletionModel, Message};
+use rig::completion::{CompletionError, CompletionModel, Message, PromptError};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, sleep_until};
@@ -103,21 +103,78 @@ const PROVIDER_RETRY_INITIAL_DELAY_MS: u64 = 2_000;
 const PROVIDER_RETRY_MAX_DELAY_MS: u64 = 30_000;
 const PROVIDER_RETRY_CONTINUE_PROMPT: &str = "Go";
 
-fn retry_delay_ms(attempt: usize, message: &str) -> Option<u64> {
-    if !is_retryable_provider_error(message) {
-        return None;
-    }
-    Some(
+fn retry_delay_ms(attempt: usize, error: &StreamingError) -> Option<u64> {
+    is_retryable_streaming_error(error).then(|| {
         PROVIDER_RETRY_INITIAL_DELAY_MS
             .saturating_mul(1_u64 << attempt.min(4))
-            .min(PROVIDER_RETRY_MAX_DELAY_MS),
-    )
+            .min(PROVIDER_RETRY_MAX_DELAY_MS)
+    })
+}
+
+fn is_retryable_streaming_error(error: &StreamingError) -> bool {
+    match error {
+        StreamingError::Completion(error) => is_retryable_completion_error(error),
+        StreamingError::Prompt(error) => match error.as_ref() {
+            PromptError::CompletionError(error) => is_retryable_completion_error(error),
+            _ => false,
+        },
+        StreamingError::Tool(_) => false,
+    }
+}
+
+fn is_retryable_completion_error(error: &CompletionError) -> bool {
+    match error {
+        CompletionError::HttpError(error) => match error {
+            rig::http_client::Error::InvalidStatusCode(status)
+            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _) => {
+                is_retryable_http_status(status.as_u16())
+            }
+            rig::http_client::Error::StreamEnded => true,
+            rig::http_client::Error::Instance(source) => source
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| {
+                    error.is_timeout()
+                        || error.is_connect()
+                        || error
+                            .status()
+                            .is_some_and(|status| is_retryable_http_status(status.as_u16()))
+                }),
+            _ => false,
+        },
+        CompletionError::ProviderError(message) => is_retryable_provider_error(message),
+        _ => false,
+    }
+}
+
+fn is_retryable_http_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
 }
 
 fn is_retryable_provider_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     if is_non_retryable_provider_error(&lower) {
         return false;
+    }
+    if let Some((code, _)) = lower.split_once(':')
+        && [
+            "server_error",
+            "internal_error",
+            "api_error",
+            "overloaded_error",
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            "provider_overloaded",
+            "provider_unavailable",
+            "resource_exhausted",
+            "unavailable",
+            "internal",
+            "server",
+            "timeout",
+            "unmapped",
+        ]
+        .contains(&code.trim())
+    {
+        return true;
     }
     [
         "timeout",
@@ -132,6 +189,9 @@ fn is_retryable_provider_error(message: &str) -> bool {
         "exhausted",
         "temporarily unavailable",
         "provider_unavailable",
+        "server_error",
+        "internal_error",
+        "internal server error",
         "service unavailable",
         "gateway timeout",
         "bad gateway",
@@ -146,7 +206,7 @@ fn is_retryable_provider_error(message: &str) -> bool {
             .split(|c: char| !c.is_ascii_digit())
             .filter(|part| part.len() == 3)
             .filter_map(|part| part.parse::<u16>().ok())
-            .any(|status| status == 408 || status == 429 || (500..=599).contains(&status))
+            .any(is_retryable_http_status)
 }
 
 fn is_non_retryable_provider_error(lower: &str) -> bool {
@@ -737,7 +797,7 @@ where
                     }
                     Err(e) => {
                         let message = e.to_string();
-                        if let Some(delay_ms) = retry_delay_ms(retry_attempts, &message) {
+                        if let Some(delay_ms) = retry_delay_ms(retry_attempts, &e) {
                             retry_attempts = retry_attempts.saturating_add(1);
                             let continuing = stream_had_output;
                             if continuing {
@@ -1290,11 +1350,19 @@ mod tests {
         streamed_reasoning_text,
     };
     use crate::session::{MessageRole, ProviderReasoning, ProviderReasoningContent, Session};
-    use rig::completion::Message;
+    use rig::agent::StreamingError;
     use rig::completion::message::{
         AssistantContent, Reasoning, ReasoningContent, Text, UserContent,
     };
+    use rig::completion::{CompletionError, Message};
     use rig::streaming::StreamedAssistantContent;
+
+    fn provider_retry_delay(attempt: usize, message: &str) -> Option<u64> {
+        retry_delay_ms(
+            attempt,
+            &StreamingError::Completion(CompletionError::ProviderError(message.to_string())),
+        )
+    }
 
     #[cfg(feature = "subagents")]
     #[test]
@@ -1502,21 +1570,33 @@ mod tests {
 
     #[test]
     fn retry_classification_retries_transient_provider_failures() {
+        let http_error = StreamingError::Completion(CompletionError::HttpError(
+            rig::http_client::Error::InvalidStatusCode(http::StatusCode::BAD_GATEWAY),
+        ));
+        assert_eq!(retry_delay_ms(0, &http_error), Some(2_000));
         assert_eq!(
-            retry_delay_ms(0, "Invalid status code 503 Service Unavailable"),
+            provider_retry_delay(0, "Invalid status code 503 Service Unavailable"),
             Some(2_000)
         );
         assert_eq!(
-            retry_delay_ms(1, "rate limit: too many requests"),
+            provider_retry_delay(1, "rate limit: too many requests"),
             Some(4_000)
         );
-        assert_eq!(retry_delay_ms(2, "provider_unavailable"), Some(8_000));
-        assert_eq!(retry_delay_ms(4, "HTTP 599"), Some(30_000));
-        assert_eq!(retry_delay_ms(20, "resource_exhausted"), Some(30_000));
+        assert_eq!(provider_retry_delay(2, "provider_unavailable"), Some(8_000));
         assert_eq!(
-            retry_delay_ms(
+            provider_retry_delay(0, "internal_error: Internal server error"),
+            Some(2_000)
+        );
+        assert_eq!(provider_retry_delay(4, "HTTP 599"), Some(30_000));
+        assert_eq!(provider_retry_delay(20, "resource_exhausted"), Some(30_000));
+        assert_eq!(
+            provider_retry_delay(0, "server_error: retry your request"),
+            Some(2_000)
+        );
+        assert_eq!(
+            provider_retry_delay(
                 0,
-                "CompletionError: ProviderError: server_is_overloaded: Our servers are currently overloaded."
+                "server_is_overloaded: Our servers are currently overloaded."
             ),
             Some(2_000)
         );
@@ -1541,14 +1621,18 @@ mod tests {
 
     #[test]
     fn retry_classification_does_not_retry_terminal_errors() {
-        assert_eq!(retry_delay_ms(0, "context_length_exceeded"), None);
+        let http_error = StreamingError::Completion(CompletionError::HttpError(
+            rig::http_client::Error::InvalidStatusCode(http::StatusCode::BAD_REQUEST),
+        ));
+        assert_eq!(retry_delay_ms(0, &http_error), None);
+        assert_eq!(provider_retry_delay(0, "context_length_exceeded"), None);
         assert_eq!(
-            retry_delay_ms(0, "No tool output found for function call"),
+            provider_retry_delay(0, "No tool output found for function call"),
             None
         );
-        assert_eq!(retry_delay_ms(0, "insufficient_quota"), None);
+        assert_eq!(provider_retry_delay(0, "insufficient_quota"), None);
         assert_eq!(
-            retry_delay_ms(0, "Invalid status code 400 Bad Request"),
+            provider_retry_delay(0, "Invalid status code 400 Bad Request"),
             None
         );
     }
