@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -65,8 +66,25 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     let dir = session_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", session.id));
-    std::fs::write(path, serialize_session(session)?)?;
-    Ok(())
+    atomic_write(&path, serialize_session(session)?.as_bytes())
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("file has no parent directory: {}", path.display()))?;
+    let temp = dir.join(format!(".{}.tmp", Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(Into::into)
 }
 
 pub fn archive_pre_compaction(session: &Session) -> anyhow::Result<PathBuf> {

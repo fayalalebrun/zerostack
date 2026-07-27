@@ -114,6 +114,46 @@ fn delete_session_removes_file() {
 }
 
 #[test]
+fn save_session_atomically_replaces_existing_file() {
+    let env = setup_test_env();
+    let mut session = Session::new("openai", "gpt-4", 128000);
+    save_session(&session).unwrap();
+    session.add_message(MessageRole::User, "new content");
+
+    save_session(&session).unwrap();
+
+    let path = env
+        .dir
+        .join("sessions")
+        .join(format!("{}.json", session.id));
+    let saved: Session = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(saved.messages[0].content, "new content");
+    assert_eq!(
+        std::fs::read_dir(env.dir.join("sessions")).unwrap().count(),
+        1
+    );
+}
+
+#[test]
+fn save_session_cleans_up_temp_file_when_replace_fails() {
+    let env = setup_test_env();
+    let session = Session::new("openai", "gpt-4", 128000);
+    let path = env
+        .dir
+        .join("sessions")
+        .join(format!("{}.json", session.id));
+    std::fs::create_dir(&path).unwrap();
+
+    assert!(save_session(&session).is_err());
+
+    let entries: Vec<_> = std::fs::read_dir(env.dir.join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries, vec![path]);
+}
+
+#[test]
 fn save_session_preserves_messages() {
     let env = setup_test_env();
     let mut s = Session::new("anthropic", "claude", 200000);
