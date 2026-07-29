@@ -2556,6 +2556,7 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
        (zerostack--set-thinking t)
        (unless zerostack--status
          (zerostack--set-status "thinking...")))
+     (zerostack--flush-backfill)
      (zerostack--replace-lines (or (plist-get plist :replace-from) 0)
                                (or (plist-get plist :lines) nil)))
     ('loop-started
@@ -2803,6 +2804,14 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
       (setq zerostack--backfill-timer
             (run-at-time 0.01 0.01 #'zerostack--backfill-step (current-buffer))))))
 
+(defun zerostack--flush-backfill ()
+  "Insert all queued history before applying an indexed render event."
+  (when (timerp zerostack--backfill-timer)
+    (cancel-timer zerostack--backfill-timer))
+  (setq zerostack--backfill-timer nil)
+  (while zerostack--backfill-queue
+    (zerostack--prepend-lines (pop zerostack--backfill-queue))))
+
 (defun zerostack--backfill-step (buffer)
   "Insert one queued history chunk into BUFFER."
   (if (not (buffer-live-p buffer))
@@ -2821,12 +2830,15 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
   (zerostack--ensure-prompt)
   (when lines
     (zerostack--without-undo
-      (let ((saved-point (copy-marker (point) nil)))
+      (let ((saved-point (copy-marker (point) nil))
+            (first-marker (car zerostack--line-markers)))
+        (when first-marker
+          (set-marker-insertion-type first-marker t))
         (unwind-protect
             (let ((new-markers nil)
                   (inhibit-read-only t)
-                  (start (if zerostack--line-markers
-                             (marker-position (car zerostack--line-markers))
+                  (start (if first-marker
+                             (marker-position first-marker)
                            (marker-position zerostack--notice-start-marker))))
               (save-excursion
                 (goto-char start)
@@ -2836,6 +2848,8 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
                     (zerostack--insert-wire-line line)))
                 (setq zerostack--line-markers
                       (append (nreverse new-markers) zerostack--line-markers))))
+          (when first-marker
+            (set-marker-insertion-type first-marker nil))
           (goto-char saved-point)
           (set-marker saved-point nil))))))
 

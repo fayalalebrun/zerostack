@@ -1147,6 +1147,28 @@
    (should zerostack--thinking)
    (should (equal zerostack--status "thinking..."))))
 
+(ert-deftest zerostack-test-stream-render-flushes-pending-history-backfill ()
+  (zerostack-test--with-buffer
+   (zerostack--replace-lines 0 '((:text "recent" :face zs-normal)))
+   (zerostack--queue-prepend-lines '((:text "older" :face zs-normal)))
+   (zerostack--handle-event
+    '(:type assistant-render :replace-from 2
+            :lines ((:text "< Implemented" :face zs-normal))))
+   (zerostack--handle-event
+    '(:type assistant-render :replace-from 2
+            :lines ((:text "< Implemented the fix" :face zs-normal))))
+   (should-not zerostack--backfill-queue)
+   (should-not zerostack--backfill-timer)
+   (should
+    (equal
+     (mapcar
+      (lambda (marker)
+        (save-excursion
+          (goto-char marker)
+          (buffer-substring-no-properties marker (line-end-position))))
+      zerostack--line-markers)
+     '("older" "recent" "< Implemented the fix")))))
+
 (ert-deftest zerostack-test-completion-call-restores-thinking-after-stale-idle ()
   (zerostack-test--with-buffer
    (zerostack--set-thinking nil)
