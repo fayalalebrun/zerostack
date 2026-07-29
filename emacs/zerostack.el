@@ -158,7 +158,7 @@ math macros while keeping the original LaTeX source and artifact link intact."
   "Face used for zerostack board rows with live sessions.")
 
 (defface zerostack-board-thinking-face
-  '((t :foreground "yellow" :weight bold))
+  '((t :inherit font-lock-constant-face :weight bold))
   "Face used for zerostack board sessions that are currently thinking.")
 
 (defface zerostack-board-input-face
