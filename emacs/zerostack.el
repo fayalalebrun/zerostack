@@ -838,13 +838,14 @@ The root is resolved with Projectile when available, then `project.el', then
                             description
                           "(no description)")
                         (if (and branch (not (string-empty-p branch))) branch "-")))
+         (status (and collapsed (zerostack-board--session-status single-active)))
          (item (append (zerostack-board--worktree-item project worktree)
                        (when single-active
                          (list :session-item (zerostack-board--session-item single-active path))))))
     (zerostack-board--insert-workspace-row
      label
      path-marker
-     (format "  %s" path)
+     (or status "")
      item
      (and single-active (zerostack-board--session-face single-active))
      inline-load-more)
@@ -868,12 +869,13 @@ The root is resolved with Projectile when available, then `project.el', then
                          (list :session-item (zerostack-board--session-item single-active path)))))
          (inline-load-more (and collapsed
                                 sessions
-                                (list key (length sessions) 0))))
+                                (list key (length sessions) 0)))
+         (status (and collapsed (zerostack-board--session-status single-active))))
     (zerostack-board--insert-workspace-row
      (format "  %s workspace  "
              (zerostack-board--alive-marker (plist-get workspace :alive)))
      path-marker
-     (format "  %s" path)
+     (or status "")
      item
      (and single-active (zerostack-board--session-face single-active))
      inline-load-more)
@@ -1058,11 +1060,9 @@ The root is resolved with Projectile when available, then `project.el', then
   (let* ((alive (plist-get session :alive))
          (title (zerostack-board--one-line (plist-get session :title)))
          (display-title (if (string-empty-p title) "(untitled)" title))
-         (updated-at (or (plist-get session :updated-at) ""))
-         (age (zerostack-board--relative-time updated-at))
          (buffer (zerostack--find-chat-buffer (plist-get session :id)
                                               (plist-get session :socket)))
-         (usage (zerostack-board--session-usage session buffer))
+         (status (zerostack-board--session-status session buffer))
          (face (if (equal (plist-get session :id) subdued-session-id)
                    'zerostack-board-session-face
                  (zerostack-board--session-face session buffer)))
@@ -1072,7 +1072,7 @@ The root is resolved with Projectile when available, then `project.el', then
     (let ((title-start (point)))
       (insert display-title)
       (add-text-properties title-start (point) `(face ,face)))
-    (insert (format "  %s%s" age (if usage (format "  %s" usage) "")))
+    (insert status)
     (add-text-properties
      start (point)
      `(mouse-face highlight
@@ -1116,6 +1116,12 @@ The root is resolved with Projectile when available, then `project.el', then
 (defun zerostack-board--alive-marker (alive)
   "Return the board marker for ALIVE state."
   (if alive "*" " "))
+
+(defun zerostack-board--session-status (session &optional buffer)
+  "Return relative update time and token usage text for SESSION."
+  (let ((age (zerostack-board--relative-time (or (plist-get session :updated-at) "")))
+        (usage (zerostack-board--session-usage session buffer)))
+    (format "  %s%s" age (if usage (format "  %s" usage) ""))))
 
 (defun zerostack-board--session-usage (session buffer)
   "Return context usage text for SESSION, preferring live BUFFER state."
