@@ -824,7 +824,62 @@ mod imp {
             }
         }
         crate::startup_profile::mark("emacs:attach_sent");
+        spawn_session_latex_render(Arc::clone(server), cols);
         Ok(())
+    }
+
+    fn spawn_session_latex_render(server: Arc<Server>, cols: usize) {
+        tokio::spawn(async move {
+            let session = server.session.lock().await.clone();
+            let options = MdOptions::ENABLE_STRIKETHROUGH
+                | MdOptions::ENABLE_TABLES
+                | MdOptions::ENABLE_TASKLISTS;
+            if !session.messages.iter().any(|msg| {
+                msg.role == MessageRole::Assistant
+                    && !find_raw_latex_spans(&sanitize_output(&msg.content), options).is_empty()
+            }) {
+                return;
+            }
+            let context = server.context.lock().await.clone();
+            let lines = render_session_lines_for(
+                &session,
+                &server.cli,
+                &server.cfg,
+                &context,
+                cols,
+                Some(&server),
+            )
+            .await;
+            let unchanged =
+                {
+                    let current = server.session.lock().await;
+                    current.id == session.id
+                        && current.messages.len() == session.messages.len()
+                        && current.messages.iter().zip(&session.messages).all(
+                            |(current, original)| {
+                                current.role == original.role && current.content == original.content
+                            },
+                        )
+                };
+            if !unchanged || server.mutable.lock().await.running {
+                return;
+            }
+            let latex_items = lines
+                .iter()
+                .flat_map(|line| line.latex.iter().cloned())
+                .collect::<Vec<_>>();
+            server
+                .send_render_event("session-render", 0, 0, lines)
+                .await;
+            if !latex_items.is_empty() {
+                server
+                    .broadcast_event(
+                        "latex-preview-ready",
+                        format!(" :turn 0 :items {}", latex_items_to_sexp(&latex_items)),
+                    )
+                    .await;
+            }
+        });
     }
 
     async fn send_lines_event(
@@ -3647,15 +3702,7 @@ mod imp {
     async fn render_session_lines(server: &Arc<Server>, cols: usize) -> Vec<WireLine> {
         let session = server.session.lock().await.clone();
         let context = server.context.lock().await.clone();
-        render_session_lines_for(
-            &session,
-            &server.cli,
-            &server.cfg,
-            &context,
-            cols,
-            Some(server),
-        )
-        .await
+        render_session_lines_for(&session, &server.cli, &server.cfg, &context, cols, None).await
     }
 
     async fn render_session_lines_for(
@@ -3705,17 +3752,32 @@ mod imp {
                             .map(|line| line.with_source(message_index, msg.role)),
                     );
                 }
-                _ => out.extend(
-                    render_message_lines(
+                _ => {
+                    let mut lines = render_message_lines(
                         msg.role,
                         &msg.content,
                         &msg.attachments,
                         msg.provider_usage,
                         cols,
-                    )
-                    .into_iter()
-                    .map(|line| line.with_source(message_index, msg.role)),
-                ),
+                    );
+                    if msg.role == MessageRole::Assistant
+                        && let Some(server) = server
+                    {
+                        attach_latex_metadata(
+                            server,
+                            u64::MAX.saturating_sub(message_index as u64),
+                            out.len(),
+                            &msg.content,
+                            &mut lines,
+                        )
+                        .await;
+                    }
+                    out.extend(
+                        lines
+                            .into_iter()
+                            .map(|line| line.with_source(message_index, msg.role)),
+                    );
+                }
             }
         }
 
@@ -5825,6 +5887,23 @@ mod imp {
 
             assert!(encoded.contains(":message-index 0 :role user"));
             assert!(encoded.contains(":message-index 1 :role assistant"));
+        }
+
+        #[tokio::test]
+        async fn resumed_session_initial_render_does_not_wait_for_latex() {
+            let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (server, registration, _listener) = test_server(prompts);
+            server
+                .session
+                .lock()
+                .await
+                .add_message(MessageRole::Assistant, "Euler: $e^{i\\pi}+1=0$");
+
+            let lines = render_session_lines(&server, 100).await;
+
+            assert!(lines.iter().any(|line| line.text.contains("Euler:")));
+            assert!(lines.iter().all(|line| line.latex.is_empty()));
+            let _ = std::fs::remove_dir_all(&registration.dir);
         }
 
         #[tokio::test]
