@@ -198,6 +198,7 @@ fn is_retryable_provider_error(message: &str) -> bool {
         "connection lost",
         "connection reset",
         "connection closed",
+        "error sending request",
         "temporary failure",
     ]
     .iter()
@@ -1585,6 +1586,13 @@ mod tests {
         assert_eq!(provider_retry_delay(2, "provider_unavailable"), Some(8_000));
         assert_eq!(
             provider_retry_delay(0, "internal_error: Internal server error"),
+            Some(2_000)
+        );
+        assert_eq!(
+            provider_retry_delay(
+                0,
+                "ProviderError: Http client error: error sending request for url (https://chatgpt.com/backend-api/codex/responses)"
+            ),
             Some(2_000)
         );
         assert_eq!(provider_retry_delay(4, "HTTP 599"), Some(30_000));
