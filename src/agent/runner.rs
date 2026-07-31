@@ -200,6 +200,7 @@ fn is_retryable_provider_error(message: &str) -> bool {
         "connection closed",
         "error sending request",
         "temporary failure",
+        "error decoding response body",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -1586,6 +1587,13 @@ mod tests {
         assert_eq!(provider_retry_delay(2, "provider_unavailable"), Some(8_000));
         assert_eq!(
             provider_retry_delay(0, "internal_error: Internal server error"),
+            Some(2_000)
+        );
+        assert_eq!(
+            provider_retry_delay(
+                0,
+                "ProviderError: Http client error: error decoding response body"
+            ),
             Some(2_000)
         );
         assert_eq!(
