@@ -10,6 +10,8 @@ use super::config::McpServerConfig;
 pub struct McpClientHandle {
     pub server_name: CompactString,
     pub running_service: RunningService<RoleClient, ()>,
+    pub discovery_timeout: Option<std::time::Duration>,
+    pub tool_timeout: Option<std::time::Duration>,
 }
 
 impl McpClientHandle {
@@ -18,7 +20,9 @@ impl McpClientHandle {
         config: &McpServerConfig,
     ) -> anyhow::Result<Self> {
         match config {
-            McpServerConfig::Command { command, args, env } => {
+            McpServerConfig::Command {
+                command, args, env, ..
+            } => {
                 let mut cmd = Command::new(command);
                 cmd.args(args);
                 for (k, v) in env {
@@ -31,12 +35,15 @@ impl McpClientHandle {
                 Ok(Self {
                     server_name,
                     running_service,
+                    discovery_timeout: config.discovery_timeout(),
+                    tool_timeout: config.tool_timeout(),
                 })
             }
             McpServerConfig::Url {
                 url,
                 headers,
                 oauth,
+                ..
             } => {
                 let custom_headers = parse_headers(headers)?;
                 let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str())
@@ -64,6 +71,8 @@ impl McpClientHandle {
                 Ok(Self {
                     server_name,
                     running_service,
+                    discovery_timeout: config.discovery_timeout(),
+                    tool_timeout: config.tool_timeout(),
                 })
             }
         }
@@ -73,8 +82,16 @@ impl McpClientHandle {
         self.running_service.peer().clone()
     }
 
-    pub async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>, rmcp::ServiceError> {
-        self.running_service.peer().list_all_tools().await
+    pub async fn list_tools(&self) -> anyhow::Result<Vec<rmcp::model::Tool>> {
+        super::timed_operation(
+            "list_tools",
+            &self.server_name,
+            None,
+            self.discovery_timeout,
+            self.running_service.peer().list_all_tools(),
+        )
+        .await?
+        .map_err(Into::into)
     }
 }
 

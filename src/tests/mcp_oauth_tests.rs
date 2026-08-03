@@ -7,6 +7,9 @@ use crate::extras::mcp::oauth;
 fn url_server_without_oauth_parses() {
     let json = r#"{ "url": "https://example.com/mcp" }"#;
     let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.connect_timeout().unwrap().as_secs(), 30);
+    assert_eq!(cfg.discovery_timeout().unwrap().as_secs(), 30);
+    assert_eq!(cfg.tool_timeout().unwrap().as_secs(), 300);
     match cfg {
         McpServerConfig::Url { url, oauth, .. } => {
             assert_eq!(url, "https://example.com/mcp");
@@ -14,6 +17,20 @@ fn url_server_without_oauth_parses() {
         }
         _ => panic!("expected Url variant"),
     }
+}
+
+#[test]
+fn zero_disables_mcp_timeouts() {
+    let json = r#"{
+        "command": "server",
+        "connect_timeout_secs": 0,
+        "discovery_timeout_secs": 0,
+        "tool_timeout_secs": 0
+    }"#;
+    let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+    assert!(cfg.connect_timeout().is_none());
+    assert!(cfg.discovery_timeout().is_none());
+    assert!(cfg.tool_timeout().is_none());
 }
 
 #[test]
@@ -121,11 +138,24 @@ fn oauth_config_round_trips_through_serde() {
         url: "https://example.com/mcp".to_string(),
         headers: Default::default(),
         oauth: Some(OAuthConfig::Enabled(true)),
+        connect_timeout_secs: 10,
+        discovery_timeout_secs: 20,
+        tool_timeout_secs: 0,
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let back: McpServerConfig = serde_json::from_str(&json).unwrap();
-    let McpServerConfig::Url { oauth, .. } = back else {
+    let McpServerConfig::Url {
+        oauth,
+        connect_timeout_secs,
+        discovery_timeout_secs,
+        tool_timeout_secs,
+        ..
+    } = back
+    else {
         panic!("expected Url variant");
     };
     assert!(oauth.unwrap().settings().is_some());
+    assert_eq!(connect_timeout_secs, 10);
+    assert_eq!(discovery_timeout_secs, 20);
+    assert_eq!(tool_timeout_secs, 0);
 }

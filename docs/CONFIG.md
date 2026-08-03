@@ -569,11 +569,36 @@ servers:
       "url": "https://example.com/mcp",
       "headers": {
         "authorization": "Bearer token"
-      }
+      },
+      "connect_timeout_secs": 30,
+      "discovery_timeout_secs": 30,
+      "tool_timeout_secs": 300
     }
   }
 }
 ```
+
+Each server accepts `connect_timeout_secs`, `discovery_timeout_secs`, and
+`tool_timeout_secs`. Their defaults are 30, 30, and 300 seconds respectively.
+Set a timeout to `0` to disable it for that server; this is useful for tools that
+legitimately run longer than five minutes.
+
+### Diagnosing pending MCP requests
+
+To identify where a request is waiting, enable MCP diagnostics and capture
+stderr:
+
+```sh
+RUST_LOG=zerostack::mcp=debug zerostack 2>mcp.log
+```
+
+The log records `started`, `still pending`, and `finished` events with an
+operation ID, server, tool, elapsed time, and phase: `connect`, `reconnect`,
+`list_tools`, `permission`, or `call_tool`. Pending events repeat every 30
+seconds until the configured deadline. A `call_tool` event that remains pending
+identifies a long-running server tool; `connect` or `list_tools` instead
+identifies startup or discovery. On expiry, the operation returns a timeout
+error rather than blocking the agent indefinitely.
 
 ### OAuth for URL servers
 

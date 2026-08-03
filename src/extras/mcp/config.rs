@@ -1,6 +1,11 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_DISCOVERY_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -11,6 +16,12 @@ pub enum McpServerConfig {
         args: Vec<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        #[serde(default = "default_connect_timeout_secs")]
+        connect_timeout_secs: u64,
+        #[serde(default = "default_discovery_timeout_secs")]
+        discovery_timeout_secs: u64,
+        #[serde(default = "default_tool_timeout_secs")]
+        tool_timeout_secs: u64,
     },
     Url {
         url: String,
@@ -18,6 +29,12 @@ pub enum McpServerConfig {
         headers: HashMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         oauth: Option<OAuthConfig>,
+        #[serde(default = "default_connect_timeout_secs")]
+        connect_timeout_secs: u64,
+        #[serde(default = "default_discovery_timeout_secs")]
+        discovery_timeout_secs: u64,
+        #[serde(default = "default_tool_timeout_secs")]
+        tool_timeout_secs: u64,
     },
 }
 
@@ -46,6 +63,57 @@ pub struct OAuthSettings {
 }
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8970;
+
+const fn default_connect_timeout_secs() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT_SECS
+}
+
+const fn default_discovery_timeout_secs() -> u64 {
+    DEFAULT_DISCOVERY_TIMEOUT_SECS
+}
+
+const fn default_tool_timeout_secs() -> u64 {
+    DEFAULT_TOOL_TIMEOUT_SECS
+}
+
+impl McpServerConfig {
+    pub fn connect_timeout(&self) -> Option<Duration> {
+        timeout(self.timeout_secs().0)
+    }
+
+    pub fn discovery_timeout(&self) -> Option<Duration> {
+        timeout(self.timeout_secs().1)
+    }
+
+    pub fn tool_timeout(&self) -> Option<Duration> {
+        timeout(self.timeout_secs().2)
+    }
+
+    fn timeout_secs(&self) -> (u64, u64, u64) {
+        match self {
+            Self::Command {
+                connect_timeout_secs,
+                discovery_timeout_secs,
+                tool_timeout_secs,
+                ..
+            }
+            | Self::Url {
+                connect_timeout_secs,
+                discovery_timeout_secs,
+                tool_timeout_secs,
+                ..
+            } => (
+                *connect_timeout_secs,
+                *discovery_timeout_secs,
+                *tool_timeout_secs,
+            ),
+        }
+    }
+}
+
+fn timeout(seconds: u64) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
 
 impl OAuthConfig {
     /// Returns the resolved settings if OAuth is enabled, or `None` if disabled.

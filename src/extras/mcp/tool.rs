@@ -29,6 +29,7 @@ pub struct McpTool {
     pub peer: Peer<RoleClient>,
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl ToolDyn for McpTool {
@@ -60,23 +61,38 @@ impl ToolDyn for McpTool {
         let peer = self.peer.clone();
         let permission = self.permission.clone();
         let ask_tx = self.ask_tx.clone();
+        let timeout = self.timeout;
 
         Box::pin(async move {
             let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
-            let coaching = check_perm(&permission, &ask_tx, "mcp_tool", &perm_key)
-                .await
-                .map_err(|e| {
-                    ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(
-                        e.to_string(),
-                    ))))
-                })?;
+            let coaching = super::trace_operation(
+                "permission",
+                &server_name,
+                Some(&tool_name),
+                check_perm(&permission, &ask_tx, "mcp_tool", &perm_key),
+            )
+            .await
+            .map_err(|e| {
+                ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(e.to_string()))))
+            })?;
 
             let arguments: Option<JsonObject> = serde_json::from_str(&args).unwrap_or_default();
             let params = arguments
                 .map(|a| CallToolRequestParams::new(tool_name.clone()).with_arguments(a))
                 .unwrap_or_else(|| CallToolRequestParams::new(tool_name.clone()));
 
-            let result = peer.call_tool(params).await.map_err(|e| {
+            let result = super::timed_operation(
+                "call_tool",
+                &server_name,
+                Some(&tool_name),
+                timeout,
+                peer.call_tool(params),
+            )
+            .await
+            .map_err(|e| {
+                ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(e.to_string()))))
+            })?
+            .map_err(|e| {
                 ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(format!(
                     "MCP tool error: {e}"
                 )))))

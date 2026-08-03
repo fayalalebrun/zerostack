@@ -227,6 +227,9 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
                 url: "https://mcp.exa.ai/mcp".to_string(),
                 headers,
                 oauth: None,
+                connect_timeout_secs: crate::extras::mcp::config::DEFAULT_CONNECT_TIMEOUT_SECS,
+                discovery_timeout_secs: crate::extras::mcp::config::DEFAULT_DISCOVERY_TIMEOUT_SECS,
+                tool_timeout_secs: crate::extras::mcp::config::DEFAULT_TOOL_TIMEOUT_SECS,
             });
     } else {
         servers.remove("Exa Web Search");
@@ -243,6 +246,9 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
                 url: "https://mcp.context7.com/mcp".to_string(),
                 headers,
                 oauth: None,
+                connect_timeout_secs: crate::extras::mcp::config::DEFAULT_CONNECT_TIMEOUT_SECS,
+                discovery_timeout_secs: crate::extras::mcp::config::DEFAULT_DISCOVERY_TIMEOUT_SECS,
+                tool_timeout_secs: crate::extras::mcp::config::DEFAULT_TOOL_TIMEOUT_SECS,
             });
     } else {
         servers.remove("Context7");
@@ -259,6 +265,9 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
                 url: "https://mcp.grep.app".to_string(),
                 headers,
                 oauth: None,
+                connect_timeout_secs: crate::extras::mcp::config::DEFAULT_CONNECT_TIMEOUT_SECS,
+                discovery_timeout_secs: crate::extras::mcp::config::DEFAULT_DISCOVERY_TIMEOUT_SECS,
+                tool_timeout_secs: crate::extras::mcp::config::DEFAULT_TOOL_TIMEOUT_SECS,
             });
     } else {
         servers.remove("Grep.app");
