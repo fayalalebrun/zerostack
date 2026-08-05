@@ -144,8 +144,9 @@ mod imp {
         input_tokens: u64,
         context_window: u64,
         cfg: &Config,
+        already_compacted: bool,
     ) -> Option<f64> {
-        if !cfg.resolve_compact_enabled() || context_window == 0 {
+        if already_compacted || !cfg.resolve_compact_enabled() || context_window == 0 {
             return None;
         }
         let threshold = cfg.resolve_mid_turn_compact_threshold()?;
@@ -3220,8 +3221,12 @@ mod imp {
                         )
                         .await;
                     if !server.cli.no_session
-                        && let Some(pressure) =
-                            should_mid_turn_compact(usage.input_tokens, context_window, &server.cfg)
+                        && let Some(pressure) = should_mid_turn_compact(
+                            usage.input_tokens,
+                            context_window,
+                            &server.cfg,
+                            retried_after_mid_turn_compact,
+                        )
                     {
                         if let Some(handle) = server.mutable.lock().await.abort_handle.take() {
                             handle.abort();
@@ -3254,7 +3259,7 @@ mod imp {
                                     " :auto t :mid-turn t",
                                 )
                                 .await;
-                                if retried_after_mid_turn_compact || !outcome.compacted {
+                                if !outcome.compacted {
                                     return Ok(None);
                                 }
                                 retried_after_mid_turn_compact = true;
@@ -6106,8 +6111,12 @@ mod imp {
                 mid_turn_compact_threshold: Some(0.90),
                 ..Config::default()
             };
-            assert_eq!(should_mid_turn_compact(901, 1_000, &cfg), Some(0.901));
-            assert_eq!(should_mid_turn_compact(900, 1_000, &cfg), None);
+            assert_eq!(
+                should_mid_turn_compact(901, 1_000, &cfg, false),
+                Some(0.901)
+            );
+            assert_eq!(should_mid_turn_compact(900, 1_000, &cfg, false), None);
+            assert_eq!(should_mid_turn_compact(901, 1_000, &cfg, true), None);
         }
 
         #[test]

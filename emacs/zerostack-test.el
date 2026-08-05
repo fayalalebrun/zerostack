@@ -1137,9 +1137,16 @@
 (ert-deftest zerostack-test-mid-turn-compact-done-keeps-buffer-active ()
   (zerostack-test--with-buffer
    (zerostack--handle-event '(:type compact-started :mid-turn t))
-   (zerostack--handle-event '(:type compact-done :mid-turn t))
+   (zerostack--handle-event '(:type compact-done :mid-turn t :compacted t))
    (should zerostack--thinking)
    (should (equal zerostack--status "continuing..."))))
+
+(ert-deftest zerostack-test-mid-turn-compact-noop-clears-busy-state ()
+  (zerostack-test--with-buffer
+   (zerostack--handle-event '(:type compact-started :mid-turn t))
+   (zerostack--handle-event '(:type compact-done :mid-turn t :compacted nil))
+   (should-not zerostack--thinking)
+   (should-not zerostack--status)))
 
 (ert-deftest zerostack-test-auto-compact-updates-tokens-and-keeps-buffer-active ()
   (zerostack-test--with-buffer
