@@ -806,7 +806,9 @@
                   default))
                ((symbol-function 'zerostack-board--call-git)
                 (lambda (dir &rest args)
-                  (push (cons dir args) git-calls)))
+                  (push (cons dir args) git-calls)
+                  (when (equal args '("rev-parse" "--git-common-dir"))
+                    ".git\n")))
                ((symbol-function 'zerostack-board-refresh)
                 (lambda () (setq refreshed t)))
                ((symbol-function 'file-directory-p)
@@ -834,6 +836,106 @@
        (should started-called)
        (should (equal started nil))
        (should (equal start-directory "/repo/live-wt/"))))))
+
+(ert-deftest zerostack-test-board-workspace-hooks ()
+  (let ((project '(:path "/repo/live"))
+        read-answers prepare hydrate git-calls refreshed)
+    (setq read-answers '("feature/hooked" ""))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _) (pop read-answers)))
+              ((symbol-function 'read-file-name)
+               (lambda (_prompt _dir default &rest _) default))
+              ((symbol-function 'zerostack-board--git-common-dir)
+               (lambda (_) "/repo/live/.git"))
+              ((symbol-function 'file-regular-p) (lambda (_) t))
+              ((symbol-function 'zerostack-board--run-workspace-prepare)
+               (lambda (&rest args) (setq prepare args)))
+              ((symbol-function 'zerostack-board--run-workspace-hydrate)
+               (lambda (&rest args) (setq hydrate args)))
+              ((symbol-function 'zerostack-board--call-git)
+               (lambda (dir &rest args) (push (cons dir args) git-calls)))
+              ((symbol-function 'zerostack-board-refresh)
+               (lambda () (setq refreshed t))))
+      (zerostack-board--create-worktree project)
+      (should refreshed)
+      (should (equal prepare
+                     '("/repo/live/.git/zerostack/workspace" "/repo/live"
+                       "/repo/live_feature-hooked" "feature/hooked"
+                       "/repo/live/.git")))
+      (should (equal hydrate prepare))
+      (should (member '("/repo/live" "worktree" "add" "-b" "feature/hooked"
+                        "/repo/live_feature-hooked" "origin/HEAD")
+                      git-calls)))))
+
+(ert-deftest zerostack-test-board-workspace-prepare-failure ()
+  (cl-letf (((symbol-function 'process-file)
+             (lambda (&rest _)
+               (insert "prepare failed")
+               7)))
+    (should-error
+     (zerostack-board--run-workspace-prepare
+      "/repo/.git/zerostack/workspace" "/repo" "/worktree" "feature"
+      "/repo/.git")
+     :type 'user-error)))
+
+(ert-deftest zerostack-test-board-workspace-prepare-exports-environment ()
+  (let ((hook (make-temp-file "zerostack-workspace-hook"))
+        (output (make-temp-file "zerostack-workspace-output")))
+    (unwind-protect
+        (progn
+          (with-temp-file hook
+            (insert
+             (format
+              "prepare() { printf '%%s|%%s|%%s|%%s|%%s' \"$ZEROSTACK_WORKSPACE_PHASE\" \"$ZEROSTACK_REPO_ROOT\" \"$ZEROSTACK_WORKTREE_PATH\" \"$ZEROSTACK_WORKTREE_NAME\" \"$ZEROSTACK_GIT_COMMON_DIR\" > %s; }\n"
+              (shell-quote-argument output))))
+          (zerostack-board--run-workspace-prepare
+           hook "/tmp" "/tmp/worktree" "feature" "/tmp/.git")
+          (with-temp-buffer
+            (insert-file-contents output)
+            (should (equal (buffer-string)
+                           "prepare|/tmp|/tmp/worktree|feature|/tmp/.git"))))
+      (delete-file hook)
+      (delete-file output))))
+
+(ert-deftest zerostack-test-board-workspace-hydrate-is-async ()
+  (let (captured-command captured-buffer captured-directory)
+    (cl-letf (((symbol-function 'async-shell-command)
+               (lambda (command buffer &rest _)
+                 (setq captured-command command
+                       captured-buffer buffer
+                       captured-directory default-directory)
+                 (get-buffer-create buffer))))
+      (zerostack-board--run-workspace-hydrate
+       "/repo/.git/zerostack/workspace" "/repo" "/worktree" "feature"
+       "/repo/.git")
+      (should (string-match-p "bash.*hydrate" captured-command))
+      (should (equal captured-buffer "*zerostack hydrate: feature*"))
+      (should (equal captured-directory "/worktree/"))
+      (should (string-match-p "ZEROSTACK_WORKSPACE_PHASE" captured-command))
+      (with-current-buffer captured-buffer
+        (should (string-prefix-p "$ " (buffer-string))))
+      (kill-buffer captured-buffer))))
+
+(ert-deftest zerostack-test-rerun-hydrate-from-chat ()
+  (zerostack-test--with-buffer
+   (let (hydrate)
+     (setq zerostack--worktree-dir "/worktree/")
+     (cl-letf (((symbol-function 'file-truename) #'identity)
+               ((symbol-function 'zerostack-board--git-common-dir)
+                (lambda (_) "/repo/.git"))
+               ((symbol-function 'zerostack-board--main-worktree)
+                (lambda (_) "/repo"))
+               ((symbol-function 'zerostack-board--call-git)
+                (lambda (_dir &rest args)
+                  (when (equal args '("branch" "--show-current"))
+                    "feature\n")))
+               ((symbol-function 'file-regular-p) (lambda (_) t))
+               ((symbol-function 'zerostack-board--run-workspace-hydrate)
+                (lambda (&rest args) (setq hydrate args))))
+       (zerostack-rerun-hydrate)
+       (should (equal hydrate
+                      '("/repo/.git/zerostack/workspace" "/repo" "/worktree/"
+                        "feature" "/repo/.git")))))))
 
 (ert-deftest zerostack-test-board-trash-actions ()
   (zerostack-test--with-board-buffer
@@ -1200,7 +1302,7 @@
 (ert-deftest zerostack-test-command-menu-fallback-dispatches-to-protocol ()
   (zerostack-test--with-buffer
    (let (dispatched)
-     (let ((choices '("attach" "compact" "loop" "thinking" "timing" "provider" "model" "subagent-provider" "subagent-model" "goal" "clear-goal" "tools" "mcp" "view" "restart")))
+     (let ((choices '("attach" "compact" "loop" "thinking" "timing" "provider" "model" "subagent-provider" "subagent-model" "goal" "clear-goal" "hydrate" "tools" "mcp" "view" "restart")))
        (cl-letf (((symbol-function 'completing-read)
                   (lambda (&rest _) (pop choices)))
                  ((symbol-function 'zerostack-attachment-menu)
@@ -1225,6 +1327,8 @@
                    (lambda (&optional _) (interactive) (push 'goal dispatched)))
                   ((symbol-function 'zerostack-clear-goal)
                    (lambda () (interactive) (push 'clear-goal dispatched)))
+                  ((symbol-function 'zerostack-rerun-hydrate)
+                   (lambda () (interactive) (push 'hydrate dispatched)))
                   ((symbol-function 'zerostack-list-tools)
                    (lambda () (interactive) (push 'tools dispatched)))
                   ((symbol-function 'zerostack-mcp)
@@ -1233,9 +1337,9 @@
                   (lambda () (interactive) (push 'view dispatched)))
                  ((symbol-function 'zerostack-restart-daemon)
                   (lambda () (interactive) (push 'restart dispatched))))
-         (dotimes (_ 15)
+         (dotimes (_ 16)
            (zerostack--command-menu-fallback))))
-     (should (equal (nreverse dispatched) '(attach compact loop thinking timing provider model subagent-provider subagent-model goal clear-goal tools mcp view restart))))))
+     (should (equal (nreverse dispatched) '(attach compact loop thinking timing provider model subagent-provider subagent-model goal clear-goal hydrate tools mcp view restart))))))
 
 (ert-deftest zerostack-test-restart-daemon-reuses_session_without_closing_buffer ()
   (zerostack-test--with-buffer

@@ -195,6 +195,15 @@ older daily logs are accessible via `/memory read` and `memory_search`.
 | `/wt-merge [branch]` | Merge the worktree branch back into the target branch. |
 | `/wt-exit` | Exit the worktree and return to the main repo. |
 
+Worktree creation sources
+`$(git rev-parse --git-common-dir)/zerostack/workspace` when present. Optional
+`prepare` and `hydrate` shell functions run before and after creation. They
+receive `ZEROSTACK_WORKSPACE_PHASE`, `ZEROSTACK_WORKTREE_NAME`,
+`ZEROSTACK_WORKTREE_PATH`, `ZEROSTACK_REPO_ROOT`, and
+`ZEROSTACK_GIT_COMMON_DIR`. Emacs board creation runs `prepare` synchronously
+before Git creation and launches `hydrate` asynchronously in a visible shell
+command buffer after creation.
+
 ## Loop (feature-gated)
 
 | Command | Description |
@@ -511,7 +520,7 @@ Key bindings in `zerostack-board-mode`:
 | --- | ------ |
 | `g` | Refresh the board snapshot. |
 | `RET` | Open the item at point. Projects/worktrees open with `dired`; live sessions connect to their socket; inactive sessions start `zerostack --emacs --session <id>`. Needs-attention rows also have a clickable `dismiss` button. |
-| `c` | Create from the item at point. On a project, prompts for a branch/path/description and runs `git worktree add` from Emacs. The new branch starts at `origin/HEAD`, and the path defaults to `<repo>_<branch>`. On a worktree, starts a new `zerostack --emacs` session with that worktree as `default-directory`. |
+| `c` | Create from the item at point. On a project, prompts for a branch/path/description, runs the local workspace `prepare` hook, and creates a worktree from `origin/HEAD`; the path defaults to `<repo>_<branch>`. The `hydrate` hook then runs without blocking in `*zerostack hydrate: <branch>*`. On a worktree, starts a new `zerostack --emacs` session with that worktree as `default-directory`. |
 | `p` | Persist a new default provider in zerostack config. The model is reset to that provider's configured/default model. |
 | `m` | Persist a new default model in zerostack config for the current default provider. |
 | `s` | Stop the live session process at point after confirmation. |
@@ -533,6 +542,7 @@ Command menu actions:
 | Action | Description |
 | ------ | ----------- |
 | `restart` | Restart the current buffer's `zerostack --emacs` daemon and reconnect without closing the buffer. |
+| `hydrate` | Rerun the current worktree's local `hydrate` hook asynchronously in a visible shell-command buffer. |
 | `view` | Change server-side markdown render width. |
 | `attach` | Add a file by path, attach image data from the clipboard, list queued attachments, or drop all queued attachments. |
 | `provider` | Switch the live session provider. This is session-local and does not rewrite config. |

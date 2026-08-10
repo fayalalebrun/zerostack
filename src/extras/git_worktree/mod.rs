@@ -154,12 +154,37 @@ pub fn default_branch(repo_path: &Path) -> Option<String> {
 }
 
 pub fn create(name: &str, base_dir: Option<&Path>) -> Result<(PathBuf, WorktreeInfo), String> {
+    let repo = std::env::current_dir().map_err(|e| format!("failed to get current dir: {}", e))?;
+    create_in(&repo, name, base_dir)
+}
+
+pub(crate) fn create_in(
+    repo: &Path,
+    name: &str,
+    base_dir: Option<&Path>,
+) -> Result<(PathBuf, WorktreeInfo), String> {
+    let main_repo = repo
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve repository path: {}", e))?;
     let target = match base_dir {
-        Some(dir) => dir.join(name),
-        None => PathBuf::from(format!("../{}", name)),
+        Some(dir) if dir.is_absolute() => dir.join(name),
+        Some(dir) => main_repo.join(dir).join(name),
+        None => main_repo.join("..").join(name),
     };
+    let common_dir = git_common_dir(&main_repo)?;
+
+    run_workspace_hook(
+        "prepare",
+        &main_repo,
+        &target,
+        name,
+        &main_repo,
+        &common_dir,
+    )?;
 
     let output = Command::new("git")
+        .arg("-C")
+        .arg(&main_repo)
         .args(["worktree", "add", "-b", name])
         .arg(&target)
         .output()
@@ -174,8 +199,8 @@ pub fn create(name: &str, base_dir: Option<&Path>) -> Result<(PathBuf, WorktreeI
         .canonicalize()
         .map_err(|e| format!("failed to resolve worktree path: {}", e))?;
 
-    let main_repo =
-        std::env::current_dir().map_err(|e| format!("failed to get current dir: {}", e))?;
+    run_workspace_hook("hydrate", &wt_path, &wt_path, name, &main_repo, &common_dir)
+        .map_err(|e| format!("worktree created at {} but {}", wt_path.display(), e))?;
 
     Ok((
         wt_path.clone(),
@@ -184,6 +209,67 @@ pub fn create(name: &str, base_dir: Option<&Path>) -> Result<(PathBuf, WorktreeI
             worktree_path: wt_path,
             main_repo_path: main_repo,
         },
+    ))
+}
+
+fn git_common_dir(repo: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .map_err(|e| format!("failed to locate git common directory: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    };
+    path.canonicalize()
+        .map_err(|e| format!("failed to resolve git common directory: {}", e))
+}
+
+fn run_workspace_hook(
+    phase: &str,
+    cwd: &Path,
+    target: &Path,
+    name: &str,
+    repo: &Path,
+    common_dir: &Path,
+) -> Result<(), String> {
+    let hook = common_dir.join("zerostack/workspace");
+    if !hook.is_file() {
+        return Ok(());
+    }
+
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "set -euo pipefail; source \"$1\"; if declare -F \"$2\" >/dev/null; then \"$2\"; fi",
+            "zerostack-workspace",
+        ])
+        .arg(&hook)
+        .arg(phase)
+        .current_dir(cwd)
+        .env("ZEROSTACK_WORKSPACE_PHASE", phase)
+        .env("ZEROSTACK_WORKTREE_NAME", name)
+        .env("ZEROSTACK_WORKTREE_PATH", target)
+        .env("ZEROSTACK_REPO_ROOT", repo)
+        .env("ZEROSTACK_GIT_COMMON_DIR", common_dir)
+        .output()
+        .map_err(|e| format!("failed to run workspace {} hook: {}", phase, e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "workspace {} hook failed: {}",
+        phase,
+        stderr.trim()
     ))
 }
 

@@ -532,6 +532,37 @@ worktree branch before exiting.
 | `--wt-force`        | Force worktree remove and branch delete (`-D`) even if dirty. |
 | `--wt-base-dir <dir>` | Base directory for worktrees (default: parent of repo). |
 
+### Local workspace hooks
+
+A repository can define uncommitted worktree hooks in its shared Git directory:
+
+```text
+$(git rev-parse --git-common-dir)/zerostack/workspace
+```
+
+The file is sourced by Bash. An optional `prepare` function runs from the main
+repository before `git worktree add`; an optional `hydrate` function runs from
+the new worktree afterward. A failed `prepare` prevents creation. A failed
+`hydrate` reports the created worktree path and leaves it available for
+inspection.
+
+```bash
+prepare() {
+    cargo install --path . --debug
+}
+
+hydrate() {
+    cp -a --reflink=auto "$ZEROSTACK_REPO_ROOT/target/." target/
+}
+```
+
+Both functions receive `ZEROSTACK_WORKSPACE_PHASE`, `ZEROSTACK_WORKTREE_NAME`,
+`ZEROSTACK_WORKTREE_PATH`, `ZEROSTACK_REPO_ROOT`, and
+`ZEROSTACK_GIT_COMMON_DIR`. The hook is local to the Git repository, shared by
+all its worktrees, and is not committed. Emacs board creation runs `prepare`
+synchronously, then starts `hydrate` without blocking in a visible
+`*zerostack hydrate: <branch>*` asynchronous shell-command buffer.
+
 ## ACP (Agent Communication Protocol) support
 
 **ACP** is a JSON-RPC based protocol that standardizes communication between code editors

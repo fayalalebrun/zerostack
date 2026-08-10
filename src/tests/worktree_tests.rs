@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use crate::cli::Cli;
     use crate::config::Config;
@@ -242,5 +244,95 @@ mod tests {
     fn test_default_branch_is_refutable() {
         // Pure-logic: the function returns None for non-existent paths (no git init)
         assert!(default_branch(&PathBuf::from("/tmp/nonexistent_repo")).is_none());
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn test_repo(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "zerostack-worktree-{}-{}",
+            label,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-b", "main"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        fs::write(root.join("README"), "test").unwrap();
+        git(&root, &["add", "README"]);
+        git(&root, &["commit", "-m", "initial"]);
+        root
+    }
+
+    fn write_hook(repo: &Path, body: &str) {
+        let dir = repo.join(".git/zerostack");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("workspace"), body).unwrap();
+    }
+
+    #[test]
+    fn workspace_hooks_are_sourced_around_creation() {
+        let repo = test_repo("hooks");
+        write_hook(
+            &repo,
+            r#"
+prepare() { printf 'prepare|%s|%s\n' "$ZEROSTACK_WORKTREE_NAME" "$PWD" >> "$ZEROSTACK_GIT_COMMON_DIR/zerostack/log"; }
+hydrate() { printf 'hydrate|%s|%s\n' "$ZEROSTACK_WORKTREE_NAME" "$PWD" >> "$ZEROSTACK_GIT_COMMON_DIR/zerostack/log"; }
+"#,
+        );
+        let base = repo.join("worktrees");
+        fs::create_dir(&base).unwrap();
+
+        let (worktree, _) = create_in(&repo, "feature", Some(&base)).unwrap();
+        let log = fs::read_to_string(repo.join(".git/zerostack/log")).unwrap();
+
+        assert_eq!(
+            log,
+            format!(
+                "prepare|feature|{}\nhydrate|feature|{}\n",
+                repo.display(),
+                worktree.display()
+            )
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn prepare_hook_failure_prevents_creation() {
+        let repo = test_repo("prepare-failure");
+        write_hook(&repo, "prepare() { echo prepare failed >&2; return 7; }");
+        let base = repo.join("worktrees");
+        fs::create_dir(&base).unwrap();
+
+        let error = create_in(&repo, "feature", Some(&base)).unwrap_err();
+
+        assert!(error.contains("workspace prepare hook failed: prepare failed"));
+        assert!(!base.join("feature").exists());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn hydrate_hook_failure_reports_created_worktree() {
+        let repo = test_repo("hydrate-failure");
+        write_hook(&repo, "hydrate() { echo hydrate failed >&2; return 8; }");
+        let base = repo.join("worktrees");
+        fs::create_dir(&base).unwrap();
+
+        let error = create_in(&repo, "feature", Some(&base)).unwrap_err();
+
+        assert!(error.contains("worktree created at"));
+        assert!(error.contains("workspace hydrate hook failed: hydrate failed"));
+        assert!(base.join("feature").exists());
+        fs::remove_dir_all(repo).unwrap();
     }
 }

@@ -1474,7 +1474,7 @@ Return non-nil when DIRECTORY was newly added."
 
 (defun zerostack-board--create-worktree (project)
   "Create a git worktree under PROJECT using Emacs-side Git commands."
-  (let* ((project-path (plist-get project :path))
+  (let* ((project-path (expand-file-name (plist-get project :path)))
          (branch (string-trim (read-string "New branch: "))))
     (when (string-empty-p branch)
       (user-error "Branch name is required"))
@@ -1485,15 +1485,100 @@ Return non-nil when DIRECTORY was newly added."
            (default-path (expand-file-name dir-name base))
            (path (expand-file-name
                   (read-file-name "Worktree path: " base default-path nil dir-name)))
-           (description (string-trim (read-string "Branch description: "))))
+           (description (string-trim (read-string "Branch description: ")))
+           (common-dir (zerostack-board--git-common-dir project-path))
+           (hook (expand-file-name "zerostack/workspace" common-dir)))
+      (when (file-regular-p hook)
+        (zerostack-board--run-workspace-prepare hook project-path path branch common-dir))
       (zerostack-board--call-git project-path "worktree" "add" "-b" branch path
                                  "origin/HEAD")
       (unless (string-empty-p description)
         (zerostack-board--call-git project-path "config"
                                    (format "branch.%s.description" branch)
                                    description))
+      (when (file-regular-p hook)
+        (zerostack-board--run-workspace-hydrate hook project-path path branch common-dir))
       (message "Created worktree %s" path)
       (zerostack-board-refresh))))
+
+(defun zerostack-board--git-common-dir (project-path)
+  "Return PROJECT-PATH's absolute shared Git directory."
+  (let ((path (string-trim
+               (zerostack-board--call-git project-path
+                                          "rev-parse" "--git-common-dir"))))
+    (if (file-name-absolute-p path)
+        (expand-file-name path)
+      (expand-file-name path project-path))))
+
+(defun zerostack-board--workspace-command-args
+    (hook phase project-path path branch common-dir)
+  "Return arguments that source HOOK and run workspace hook PHASE."
+  (list
+   "bash" "-c"
+   (concat "set -euo pipefail; "
+           "export ZEROSTACK_WORKSPACE_PHASE=\"$2\" "
+           "ZEROSTACK_REPO_ROOT=\"$3\" ZEROSTACK_WORKTREE_PATH=\"$4\" "
+           "ZEROSTACK_WORKTREE_NAME=\"$5\" ZEROSTACK_GIT_COMMON_DIR=\"$6\"; "
+           "source \"$1\"; if declare -F \"$2\" >/dev/null; then \"$2\"; fi")
+   "zerostack-workspace" hook phase project-path path branch common-dir))
+
+(defun zerostack-board--workspace-command
+    (hook phase project-path path branch common-dir)
+  "Return the shell command that sources HOOK and runs PHASE."
+  (mapconcat
+   #'shell-quote-argument
+   (zerostack-board--workspace-command-args
+    hook phase project-path path branch common-dir)
+   " "))
+
+(defun zerostack-board--run-workspace-prepare (hook project-path path branch common-dir)
+  "Synchronously run the workspace prepare function from HOOK."
+  (let ((default-directory (file-name-as-directory project-path))
+        (command (zerostack-board--workspace-command-args
+                  hook "prepare" project-path path branch common-dir)))
+    (with-temp-buffer
+      (let ((status (apply #'process-file (car command) nil t nil (cdr command))))
+        (unless (and (integerp status) (zerop status))
+          (user-error "Workspace prepare hook failed: %s"
+                      (string-trim (buffer-string))))))))
+
+(defun zerostack-board--run-workspace-hydrate (hook project-path path branch common-dir)
+  "Asynchronously run the workspace hydrate function from HOOK."
+  (let* ((default-directory (file-name-as-directory path))
+         (command (zerostack-board--workspace-command
+                   hook "hydrate" project-path path branch common-dir))
+         (buffer-name
+          (generate-new-buffer-name (format "*zerostack hydrate: %s*" branch))))
+    (async-shell-command command buffer-name)
+    (with-current-buffer (get-buffer-create buffer-name)
+      (let ((inhibit-read-only t))
+        (save-excursion
+          (goto-char (point-min))
+          (insert "$ " command "\n\n"))))))
+
+(defun zerostack-board--main-worktree (path)
+  "Return the main worktree associated with the Git checkout at PATH."
+  (let ((output (zerostack-board--call-git path "worktree" "list" "--porcelain")))
+    (if (string-match "\\`worktree \\(.+\\)$" output)
+        (expand-file-name (match-string 1 output))
+      (user-error "Cannot determine main worktree from %s" path))))
+
+(defun zerostack-rerun-hydrate ()
+  "Rerun the local workspace hydrate hook for the current worktree."
+  (interactive)
+  (let* ((path (file-truename
+                (or zerostack--worktree-dir zerostack--cwd default-directory)))
+         (common-dir (zerostack-board--git-common-dir path))
+         (hook (expand-file-name "zerostack/workspace" common-dir))
+         (project-path (zerostack-board--main-worktree path))
+         (branch (string-trim
+                  (zerostack-board--call-git path "branch" "--show-current"))))
+    (unless (file-regular-p hook)
+      (user-error "No workspace hook at %s" hook))
+    (when (string-empty-p branch)
+      (user-error "Cannot hydrate a detached worktree"))
+    (zerostack-board--run-workspace-hydrate
+     hook project-path path branch common-dir)))
 
 (defun zerostack-board--create-session (worktree)
   "Start a new zerostack session in WORKTREE."
@@ -2205,7 +2290,7 @@ When BINARY is non-nil, DATA is written with binary coding."
   (defhydra zerostack-command-hydra (:hint nil :color blue)
     "
 Zerostack
-_k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear goal  _l_ loop  _t_ thinking  _i_ timing  _p_ provider  _m_ model  _P_ subagent provider  _S_ subagent model  _T_ tools  _M_ MCP  _v_ view  _o_ artifact  _R_ restart
+_k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear goal  _l_ loop  _h_ hydrate  _t_ thinking  _i_ timing  _p_ provider  _m_ model  _P_ subagent provider  _S_ subagent model  _T_ tools  _M_ MCP  _v_ view  _o_ artifact  _R_ restart
 "
     ("k" zerostack-skill-menu)
     ("a" zerostack-attachment-menu)
@@ -2215,6 +2300,7 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
     ("g" zerostack-goal-set)
     ("G" zerostack-clear-goal)
     ("l" zerostack-loop)
+    ("h" zerostack-rerun-hydrate)
     ("t" zerostack-thinking-menu)
     ("i" zerostack-timing)
     ("p" zerostack-provider-menu)
@@ -2238,7 +2324,7 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
   "Fallback command menu used when Hydra is unavailable."
   (let* ((commands '("skill" "attach" "compact" "rewind" "redo" "loop" "thinking" "timing"
                     "provider" "model" "subagent-provider" "subagent-model" "goal"
-                    "clear-goal" "tools" "mcp" "view" "artifact" "restart"))
+                    "clear-goal" "hydrate" "tools" "mcp" "view" "artifact" "restart"))
          (choice (completing-read "Zerostack command: " commands nil t)))
     (pcase choice
       ("skill" (zerostack-skill-menu))
@@ -2255,6 +2341,7 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
       ("subagent-model" (call-interactively #'zerostack-subagent-model-menu))
       ("goal" (call-interactively #'zerostack-goal))
       ("clear-goal" (call-interactively #'zerostack-clear-goal))
+      ("hydrate" (call-interactively #'zerostack-rerun-hydrate))
       ("tools" (call-interactively #'zerostack-list-tools))
       ("mcp" (call-interactively #'zerostack-mcp))
       ("view" (call-interactively #'zerostack-set-view))
