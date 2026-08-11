@@ -805,14 +805,15 @@ where
         .preamble(&preamble)
         .build();
 
-    let started = std::time::Instant::now();
+    let mut started = std::time::Instant::now();
     let mut stream = agent
-        .stream_chat(prompt, Vec::<Message>::new())
+        .stream_chat(prompt.clone(), Vec::<Message>::new())
         .multi_turn(1)
         .await;
 
     let mut response = String::new();
     let mut provider_call = None;
+    let mut retry_attempts = 0;
     use futures::StreamExt;
     while let Some(item) = stream.next().await {
         match item {
@@ -830,7 +831,21 @@ where
                 response = res.response().to_string();
                 break;
             }
-            Err(e) => return Err(anyhow::anyhow!("Compression failed: {}", e)),
+            Err(e) => {
+                if let Some(delay_ms) = runner::retry_delay_ms(retry_attempts, &e) {
+                    retry_attempts = retry_attempts.saturating_add(1);
+                    response.clear();
+                    provider_call = None;
+                    runner::sleep_for_retry(delay_ms).await;
+                    started = std::time::Instant::now();
+                    stream = agent
+                        .stream_chat(prompt.clone(), Vec::<Message>::new())
+                        .multi_turn(1)
+                        .await;
+                    continue;
+                }
+                return Err(anyhow::anyhow!("Compression failed: {}", e));
+            }
             _ => {}
         }
     }

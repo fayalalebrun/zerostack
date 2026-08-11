@@ -103,7 +103,7 @@ const PROVIDER_RETRY_INITIAL_DELAY_MS: u64 = 2_000;
 const PROVIDER_RETRY_MAX_DELAY_MS: u64 = 30_000;
 const PROVIDER_RETRY_CONTINUE_PROMPT: &str = "Go";
 
-fn retry_delay_ms(attempt: usize, error: &StreamingError) -> Option<u64> {
+pub(crate) fn retry_delay_ms(attempt: usize, error: &StreamingError) -> Option<u64> {
     is_retryable_streaming_error(error).then(|| {
         PROVIDER_RETRY_INITIAL_DELAY_MS
             .saturating_mul(1_u64 << attempt.min(4))
@@ -240,7 +240,7 @@ fn is_non_retryable_provider_error(lower: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-async fn sleep_for_retry(delay_ms: u64) {
+pub(crate) async fn sleep_for_retry(delay_ms: u64) {
     sleep(Duration::from_millis(delay_ms)).await;
 }
 
@@ -255,6 +255,16 @@ fn preserve_retry_output(
     if !partial_text.is_empty() {
         history.push(Message::assistant(partial_text));
     }
+}
+
+fn prepare_retry_continuation(
+    history: &mut Vec<Message>,
+    prompt: &mut String,
+    tool_interactions: &mut Vec<Message>,
+    partial_text: &str,
+) {
+    preserve_retry_output(history, prompt, tool_interactions, partial_text);
+    *prompt = PROVIDER_RETRY_CONTINUE_PROMPT.to_string();
 }
 
 /// Spawn an isolated, single-turn, tool-less side-question run. The full result
@@ -803,13 +813,12 @@ where
                             retry_attempts = retry_attempts.saturating_add(1);
                             let continuing = stream_had_output;
                             if continuing {
-                                preserve_retry_output(
+                                prepare_retry_continuation(
                                     &mut retry_history,
-                                    &retry_prompt,
+                                    &mut retry_prompt,
                                     &mut tool_interactions,
                                     &partial_text,
                                 );
-                                retry_prompt = PROVIDER_RETRY_CONTINUE_PROMPT.to_string();
                             }
                             partial_text.clear();
                             stream_had_output = false;
@@ -1118,15 +1127,21 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
     P: rig::agent::PromptHook<M> + 'static,
 {
+    let mut retry_prompt = prompt.to_string();
+    let mut retry_history = Vec::<Message>::new();
+    let mut tool_interactions = Vec::<Message>::new();
     let mut stream = agent
-        .stream_chat(prompt.to_string(), Vec::<Message>::new())
+        .stream_chat(retry_prompt.clone(), retry_history.clone())
         .with_hook(SubagentPromptHook)
         .max_invalid_tool_call_retries(SUBAGENT_INVALID_TOOL_RETRIES)
         .multi_turn(max_turns)
         .await;
 
     let mut full_response = String::new();
+    let mut preserved_response = String::new();
     let mut tool_notes: Vec<String> = Vec::new();
+    let mut retry_attempts = 0;
+    let mut stream_had_output = false;
     let timeout_deadline =
         limits.and_then(|limits| limits.timeout_cutoff.map(|d| Instant::now() + d));
 
@@ -1135,7 +1150,12 @@ where
             tokio::select! {
                 item = stream.next() => item,
                 _ = sleep_until(deadline) => {
-                    return subagent_timeout_cutoff_response(agent, prompt, &full_response, &tool_notes).await;
+                    return subagent_timeout_cutoff_response(
+                        agent,
+                        prompt,
+                        &format!("{preserved_response}{full_response}"),
+                        &tool_notes,
+                    ).await;
                 }
             }
         } else {
@@ -1144,12 +1164,15 @@ where
         let Some(item) = item else { break };
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+                stream_had_output |= !text.text.is_empty();
                 full_response.push_str(&text.text);
             }
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
                 tool_call,
                 ..
             })) => {
+                stream_had_output = true;
+                tool_interactions.push(tool_call.clone().into());
                 tool_notes.push(format!("called tool `{}`", tool_call.function.name));
                 if let Some(tx) = event_tx {
                     let _ = tx
@@ -1173,6 +1196,8 @@ where
                         output.push_str(&t.text);
                     }
                 }
+                stream_had_output = true;
+                tool_interactions.push(tool_result.clone().into());
                 if !output.is_empty() {
                     tool_notes.push(format!(
                         "tool result: {}",
@@ -1189,7 +1214,7 @@ where
                     return subagent_context_cutoff_response(
                         agent,
                         prompt,
-                        &full_response,
+                        &format!("{preserved_response}{full_response}"),
                         &tool_notes,
                         usage.context_tokens(),
                         limits.context_window,
@@ -1203,16 +1228,39 @@ where
             }
             Ok(_) => {}
             Err(e) => {
+                if let Some(delay_ms) = retry_delay_ms(retry_attempts, &e) {
+                    retry_attempts = retry_attempts.saturating_add(1);
+                    if stream_had_output {
+                        preserved_response.push_str(&full_response);
+                        prepare_retry_continuation(
+                            &mut retry_history,
+                            &mut retry_prompt,
+                            &mut tool_interactions,
+                            &full_response,
+                        );
+                    }
+                    full_response.clear();
+                    stream_had_output = false;
+                    sleep_for_retry(delay_ms).await;
+                    stream = agent
+                        .stream_chat(retry_prompt.clone(), retry_history.clone())
+                        .with_hook(SubagentPromptHook)
+                        .max_invalid_tool_call_retries(SUBAGENT_INVALID_TOOL_RETRIES)
+                        .multi_turn(max_turns)
+                        .await;
+                    continue;
+                }
                 return Err(anyhow::anyhow!("subagent error: {}", e));
             }
         }
     }
 
-    if full_response.is_empty() {
+    preserved_response.push_str(&full_response);
+    if preserved_response.is_empty() {
         anyhow::bail!("subagent returned empty response");
     }
 
-    Ok(full_response)
+    Ok(preserved_response)
 }
 
 #[cfg(feature = "subagents")]
@@ -1245,24 +1293,7 @@ where
         tool_notes,
         &format!("has reached {context_tokens}/{context_window} context tokens (>=90%)"),
     );
-    let mut stream = agent.stream_chat(prompt, Vec::<Message>::new()).await;
-    let mut response = String::new();
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                response.push_str(&text.text);
-            }
-            Ok(MultiTurnStreamItem::FinalResponse(res)) => {
-                let final_response = res.response();
-                if !final_response.is_empty() {
-                    response = final_response.to_string();
-                }
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => return Err(anyhow::anyhow!("subagent cutoff response error: {}", e)),
-        }
-    }
+    let response = run_subagent_cutoff_stream(agent, prompt).await?;
     if response.trim().is_empty() {
         anyhow::bail!(
             "subagent reached {context_tokens}/{context_window} context tokens and returned empty cutoff response"
@@ -1289,28 +1320,53 @@ where
         tool_notes,
         "has reached 90% of its timeout budget",
     );
-    let mut stream = agent.stream_chat(prompt, Vec::<Message>::new()).await;
-    let mut response = String::new();
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                response.push_str(&text.text);
-            }
-            Ok(MultiTurnStreamItem::FinalResponse(res)) => {
-                let final_response = res.response();
-                if !final_response.is_empty() {
-                    response = final_response.to_string();
-                }
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => return Err(anyhow::anyhow!("subagent cutoff response error: {}", e)),
-        }
-    }
+    let response = run_subagent_cutoff_stream(agent, prompt).await?;
     if response.trim().is_empty() {
         anyhow::bail!("subagent reached timeout cutoff and returned empty cutoff response");
     }
     Ok(response)
+}
+
+#[cfg(feature = "subagents")]
+async fn run_subagent_cutoff_stream<M, P>(
+    agent: &Agent<M, P>,
+    prompt: String,
+) -> anyhow::Result<String>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+    P: rig::agent::PromptHook<M> + 'static,
+{
+    let mut retry_attempts = 0;
+    'retry: loop {
+        let mut stream = agent
+            .stream_chat(prompt.clone(), Vec::<Message>::new())
+            .await;
+        let mut response = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
+                    text,
+                ))) => response.push_str(&text.text),
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    if !res.response().is_empty() {
+                        response = res.response().to_string();
+                    }
+                    return Ok(response);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if let Some(delay_ms) = retry_delay_ms(retry_attempts, &e) {
+                        retry_attempts = retry_attempts.saturating_add(1);
+                        sleep_for_retry(delay_ms).await;
+                        continue 'retry;
+                    }
+                    return Err(anyhow::anyhow!("subagent cutoff response error: {}", e));
+                }
+            }
+        }
+        return Ok(response);
+    }
 }
 
 #[cfg(feature = "subagents")]
@@ -1347,7 +1403,7 @@ mod tests {
     #[cfg(feature = "subagents")]
     use super::{SubagentLimits, subagent_cutoff_prompt, subagent_invalid_tool_feedback};
     use super::{
-        convert_history, preserve_retry_output, retry_delay_ms,
+        convert_history, prepare_retry_continuation, retry_delay_ms,
         streamed_assistant_content_has_output, streamed_provider_reasoning,
         streamed_reasoning_text,
     };
@@ -1621,9 +1677,12 @@ mod tests {
     #[test]
     fn retry_history_keeps_every_partial_attempt() {
         let mut history = Vec::new();
+        let mut prompt = "original".to_string();
         let mut interactions = Vec::new();
-        preserve_retry_output(&mut history, "original", &mut interactions, "first half");
-        preserve_retry_output(&mut history, "Go", &mut interactions, "second half");
+        prepare_retry_continuation(&mut history, &mut prompt, &mut interactions, "first half");
+        prepare_retry_continuation(&mut history, &mut prompt, &mut interactions, "second half");
+
+        assert_eq!(prompt, "Go");
 
         assert!(matches!(&history[0], Message::User { content } if
             matches!(content.first(), UserContent::Text(text) if text.text == "original")));
