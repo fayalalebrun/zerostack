@@ -38,6 +38,7 @@ mod imp {
     const DEFAULT_COLS: usize = 100;
     const EVENT_BUFFER: usize = 512;
     const ARTIFACT_PREVIEW_CHARS: usize = 240;
+    const STREAM_RENDER_INTERVAL: Duration = Duration::from_millis(33);
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct SessionMeta {
@@ -279,6 +280,55 @@ mod imp {
             self.message_index = Some(message_index);
             self.role = Some(role);
             self
+        }
+    }
+
+    struct StreamRenderState {
+        rendered: Vec<WireLine>,
+        dirty: bool,
+        next_flush: Instant,
+    }
+
+    impl StreamRenderState {
+        fn new(now: Instant) -> Self {
+            Self {
+                rendered: Vec::new(),
+                dirty: false,
+                next_flush: now,
+            }
+        }
+
+        fn mark_dirty(&mut self) {
+            self.dirty = true;
+        }
+
+        fn flush_due(&self, now: Instant) -> bool {
+            self.dirty && now >= self.next_flush
+        }
+
+        fn replace(
+            &mut self,
+            lines: Vec<WireLine>,
+            now: Instant,
+        ) -> Option<(usize, Vec<WireLine>)> {
+            let unchanged = self
+                .rendered
+                .iter()
+                .zip(&lines)
+                .take_while(|(old, new)| old == new)
+                .count();
+            let changed = unchanged != self.rendered.len() || unchanged != lines.len();
+            let suffix = changed.then(|| lines[unchanged..].to_vec());
+            self.rendered = lines;
+            self.dirty = false;
+            self.next_flush = now + STREAM_RENDER_INTERVAL;
+            suffix.map(|suffix| (unchanged, suffix))
+        }
+
+        fn reset(&mut self, now: Instant) {
+            self.rendered.clear();
+            self.dirty = false;
+            self.next_flush = now;
         }
     }
 
@@ -639,6 +689,39 @@ mod imp {
                 preview: preview_text(contents),
             })
         }
+    }
+
+    async fn flush_streamed_response(
+        server: &Server,
+        turn: u64,
+        assistant_index: usize,
+        response: &str,
+        response_start_line: &mut Option<usize>,
+        state: &mut StreamRenderState,
+    ) {
+        if !state.dirty {
+            return;
+        }
+        let cols = server.mutable.lock().await.cols;
+        let lines = with_source_lines(
+            render_assistant_lines(response, cols, false),
+            assistant_index,
+            MessageRole::Assistant,
+        );
+        let Some((offset, suffix)) = state.replace(lines, Instant::now()) else {
+            return;
+        };
+        let start = match *response_start_line {
+            Some(start) => start,
+            None => {
+                let start = server.mutable.lock().await.line_count;
+                *response_start_line = Some(start);
+                start
+            }
+        };
+        server
+            .send_render_event("assistant-render", turn, start + offset, suffix)
+            .await;
     }
 
     async fn handle_client(server: Arc<Server>, stream: tokio::net::UnixStream) {
@@ -2843,12 +2926,45 @@ mod imp {
 
         let mut response_buf = String::new();
         let mut response_start_line: Option<usize> = None;
+        let mut stream_render = StreamRenderState::new(Instant::now());
         let mut reasoning_buf = String::new();
         let mut reasoning_start_line: Option<usize> = None;
         let mut retried_after_mid_turn_compact = false;
         let mut continued_after_auto_compact = false;
 
-        while let Some(event) = runner.event_rx.recv().await {
+        loop {
+            let event = if stream_render.dirty {
+                tokio::select! {
+                    event = runner.event_rx.recv() => event,
+                    _ = tokio::time::sleep_until(stream_render.next_flush.into()) => {
+                        flush_streamed_response(
+                            &server,
+                            turn,
+                            assistant_index,
+                            &response_buf,
+                            &mut response_start_line,
+                            &mut stream_render,
+                        ).await;
+                        continue;
+                    }
+                }
+            } else {
+                runner.event_rx.recv().await
+            };
+            let Some(event) = event else {
+                break;
+            };
+            if !matches!(&event, AgentEvent::Token(_)) {
+                flush_streamed_response(
+                    &server,
+                    turn,
+                    assistant_index,
+                    &response_buf,
+                    &mut response_start_line,
+                    &mut stream_render,
+                )
+                .await;
+            }
             match event {
                 AgentEvent::Reasoning(text) => {
                     let safe = sanitize_output(&text);
@@ -2905,32 +3021,30 @@ mod imp {
                 }
                 AgentEvent::Token(text) => {
                     let safe = sanitize_output(&text);
+                    if safe.is_empty() {
+                        continue;
+                    }
                     response_buf.push_str(&safe);
-                    let cols = {
+                    {
                         let mut mutable = server.mutable.lock().await;
                         if let Some((active_turn, active_response)) = &mut mutable.active_response
                             && *active_turn == turn
                         {
                             active_response.push_str(&safe);
                         }
-                        mutable.cols
-                    };
-                    let lines = with_source_lines(
-                        render_assistant_lines(&response_buf, cols, false),
-                        assistant_index,
-                        MessageRole::Assistant,
-                    );
-                    let start = match response_start_line {
-                        Some(start) => start,
-                        None => {
-                            let start = server.mutable.lock().await.line_count;
-                            response_start_line = Some(start);
-                            start
-                        }
-                    };
-                    server
-                        .send_render_event("assistant-render", turn, start, lines)
+                    }
+                    stream_render.mark_dirty();
+                    if stream_render.flush_due(Instant::now()) {
+                        flush_streamed_response(
+                            &server,
+                            turn,
+                            assistant_index,
+                            &response_buf,
+                            &mut response_start_line,
+                            &mut stream_render,
+                        )
                         .await;
+                    }
                 }
                 AgentEvent::ToolCall {
                     id,
@@ -2973,6 +3087,7 @@ mod imp {
                     }
                     response_buf.clear();
                     response_start_line = None;
+                    stream_render.reset(Instant::now());
                     server
                         .append_lines(
                             "tool-render",
@@ -3166,6 +3281,7 @@ mod imp {
                         drop(session);
                         response_buf.clear();
                         response_start_line = None;
+                        stream_render.reset(Instant::now());
                         reasoning_buf.clear();
                         reasoning_start_line = None;
                         server
@@ -3265,6 +3381,7 @@ mod imp {
                                 retried_after_mid_turn_compact = true;
                                 response_buf.clear();
                                 response_start_line = None;
+                                stream_render.reset(Instant::now());
                                 reasoning_buf.clear();
                                 reasoning_start_line = None;
                                 let history = {
@@ -3327,9 +3444,11 @@ mod imp {
                     );
                     let latex_items =
                         attach_latex_metadata(&server, turn, start, &response, &mut lines).await;
-                    server
-                        .send_render_event("assistant-render", turn, start, lines)
-                        .await;
+                    if let Some((offset, suffix)) = stream_render.replace(lines, Instant::now()) {
+                        server
+                            .send_render_event("assistant-render", turn, start + offset, suffix)
+                            .await;
+                    }
                     let (
                         tokens,
                         context_window,
@@ -3421,6 +3540,7 @@ mod imp {
                         retried_after_mid_turn_compact = true;
                         response_buf.clear();
                         response_start_line = None;
+                        stream_render.reset(Instant::now());
                         reasoning_buf.clear();
                         reasoning_start_line = None;
                         let history = {
@@ -3482,6 +3602,15 @@ mod imp {
             }
         }
 
+        flush_streamed_response(
+            &server,
+            turn,
+            assistant_index,
+            &response_buf,
+            &mut response_start_line,
+            &mut stream_render,
+        )
+        .await;
         let (should_report, should_persist) = {
             let mut mutable = server.mutable.lock().await;
             let should_persist = mutable
@@ -6250,6 +6379,45 @@ mod imp {
                 lines_to_sexp(&lines),
                 "((:text \"  output: bash (12 B)\" :face zs-link :artifact (:kind tool-output :path \"/tmp/zs/artifacts/turn-1/0001-bash.txt\" :mime \"text/plain; charset=utf-8\" :bytes 12 :preview \"hello world\" :ephemeral t :expires process-exit)))"
             );
+        }
+
+        #[test]
+        fn stream_render_updates_only_the_changed_suffix() {
+            let now = Instant::now();
+            let mut state = StreamRenderState::new(now);
+            let first = vec![
+                WireLine::new("first", "zs-normal"),
+                WireLine::new("second", "zs-normal"),
+            ];
+            assert_eq!(state.replace(first, now).unwrap().0, 0);
+
+            let changed = vec![
+                WireLine::new("first", "zs-normal"),
+                WireLine::new("changed", "zs-normal"),
+                WireLine::new("third", "zs-normal"),
+            ];
+            let (offset, suffix) = state.replace(changed, now).unwrap();
+            assert_eq!(offset, 1);
+            assert_eq!(suffix.len(), 2);
+            assert_eq!(suffix[0].text, "changed");
+
+            let (offset, suffix) = state
+                .replace(vec![WireLine::new("first", "zs-normal")], now)
+                .unwrap();
+            assert_eq!(offset, 1);
+            assert!(suffix.is_empty());
+        }
+
+        #[test]
+        fn stream_render_coalesces_updates_until_the_deadline() {
+            let now = Instant::now();
+            let mut state = StreamRenderState::new(now);
+            state.mark_dirty();
+            assert!(state.flush_due(now));
+            state.replace(vec![WireLine::new("first", "zs-normal")], now);
+            state.mark_dirty();
+            assert!(!state.flush_due(now + STREAM_RENDER_INTERVAL / 2));
+            assert!(state.flush_due(now + STREAM_RENDER_INTERVAL));
         }
 
         #[test]
