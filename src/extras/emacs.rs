@@ -813,6 +813,7 @@ mod imp {
             "redo" => handle_redo(&server, &cmd, out).await,
             "provider" => handle_provider(&server, &cmd, out).await,
             "model" => handle_model(&server, &cmd, out).await,
+            "subagents" => handle_subagents(&server, &cmd, out).await,
             "subagent-provider" => handle_subagent_provider(&server, &cmd, out).await,
             "subagent-model" => handle_subagent_model(&server, &cmd, out).await,
             "list-tools" | "tools" => handle_list_tools(&server, &cmd, out).await,
@@ -1290,7 +1291,7 @@ mod imp {
         Ok(())
     }
 
-    fn builtin_tool_names(cfg: &Config) -> Vec<&'static str> {
+    fn builtin_tool_names(_cfg: &Config) -> Vec<&'static str> {
         let mut tools = vec![
             "read",
             "write",
@@ -1303,7 +1304,7 @@ mod imp {
             "goal_update",
         ];
         #[cfg(feature = "subagents")]
-        if cfg.task_enabled.unwrap_or(true) {
+        if crate::extras::subagents::is_enabled() {
             tools.push("task");
         }
         #[cfg(feature = "memory")]
@@ -1456,6 +1457,53 @@ mod imp {
         )
         .await;
         Ok(())
+    }
+
+    #[cfg(feature = "subagents")]
+    async fn handle_subagents(
+        server: &Arc<Server>,
+        cmd: &Command,
+        out: &mpsc::Sender<String>,
+    ) -> anyhow::Result<()> {
+        ensure_idle_for_switch(server, "subagents").await?;
+        let enabled = match string_arg(cmd, "state")
+            .or_else(|| atom_arg(cmd, "state"))
+            .as_deref()
+        {
+            Some("on") => true,
+            Some("off") => false,
+            _ => anyhow::bail!("subagents requires :state on or off"),
+        };
+        crate::extras::subagents::set_enabled(enabled);
+        {
+            let mut session = server.session.lock().await;
+            session.subagents_enabled = Some(enabled);
+            if !server.cli.no_session {
+                crate::session::storage::save_session(&session)?;
+            }
+        }
+        server.update_meta_from_session().await;
+        let message = format!("subagents: {}", if enabled { "on" } else { "off" });
+        send_ok(
+            out,
+            request_arg(cmd),
+            format!(
+                " :subagents-enabled {} :message {}",
+                if enabled { "t" } else { "nil" },
+                sexp_quote(&message),
+            ),
+        )
+        .await;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "subagents"))]
+    async fn handle_subagents(
+        _server: &Arc<Server>,
+        _cmd: &Command,
+        _out: &mpsc::Sender<String>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("subagents support not enabled")
     }
 
     #[cfg(feature = "subagents")]

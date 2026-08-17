@@ -101,6 +101,11 @@ pub fn set_default_model(cfg: &mut Config, model: &str) -> anyhow::Result<(Strin
 }
 
 #[cfg(feature = "subagents")]
+pub fn set_subagents_enabled(cfg: &mut Config, enabled: bool) {
+    cfg.task_enabled = Some(enabled);
+}
+
+#[cfg(feature = "subagents")]
 pub fn set_subagent_provider(cfg: &mut Config, provider: &str) -> anyhow::Result<(String, String)> {
     validate_provider(cfg, provider)?;
     let provider = canonical_provider_name(provider);
@@ -246,6 +251,19 @@ mod tests {
         assert_eq!(model, "gemini-2.5-pro");
         assert_eq!(cfg.provider.as_deref(), Some("gemini"));
         assert_eq!(cfg.model.as_deref(), Some("gemini-2.5-pro"));
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn set_subagents_enabled_persists_default() {
+        let mut cfg = Config::default();
+        set_subagents_enabled(&mut cfg, false);
+        assert_eq!(cfg.task_enabled, Some(false));
+
+        let mut session = crate::session::Session::new("openai", "gpt-5", 128_000);
+        assert!(session.resolve_subagents_enabled(&cfg));
+        session.subagents_enabled = Some(false);
+        assert!(!session.resolve_subagents_enabled(&Config::default()));
     }
 
     #[cfg(feature = "subagents")]

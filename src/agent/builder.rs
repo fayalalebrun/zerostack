@@ -223,7 +223,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let mut builder = builder.tools(base_tools.into_vec());
 
         #[cfg(feature = "subagents")]
-        if cfg.task_enabled.unwrap_or(true) {
+        if crate::extras::subagents::is_enabled() {
             use crate::extras::subagents::task_tool::TaskTool;
             builder = builder.tool(TaskTool::new(permission.clone(), ask_tx.clone()));
         }

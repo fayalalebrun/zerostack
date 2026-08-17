@@ -90,7 +90,7 @@ The main agent's `task` tool itself goes through the normal permission check
 | Config field           | Type      | Default             | Description                           |
 |------------------------|-----------|---------------------|---------------------------------------|
 | `task_max_turns`       | `usize`   | `15`                | Max agent turns per subagent          |
-| `task_enabled`         | `bool`    | `true`              | Whether the `task` tool is registered |
+| `task_enabled`         | `bool`    | `true`              | Global default for all subagent use   |
 | `subagent_model`       | `string`  | `none (uses main model)` | Model name or quick-model alias       |
 | `subagent_provider`    | `string`  | (same as main)      | Provider for the subagent (optional)  |
 
@@ -104,6 +104,10 @@ The main agent's `task` tool itself goes through the normal permission check
 When the subagent uses a different provider than the main agent, a separate
 API client is created at startup. The subagent client is independent from the
 main agent's client and can be switched at runtime.
+
+Set the default for new sessions with `zerostack config set-subagents true|false`.
+Each session stores its own value; `/subagents on|off` changes that session only.
+Disabling subagents removes the `task` tool and prevents automatic goal evaluators.
 
 Example `opencode.json`:
 
@@ -143,6 +147,7 @@ transcript.
 
 | Command                            | Description                                |
 |------------------------------------|--------------------------------------------|
+| `/subagents [on|off]`              | Show or set subagent use for this session  |
 | `/model-subagent [name]`           | Show or switch the subagent's model        |
 | `/models-subagent [name]`          | List quick models or switch subagent to one|
 

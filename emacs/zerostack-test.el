@@ -99,6 +99,7 @@
     :model "gpt-5.5"
     :subagent-provider "openrouter"
     :subagent-model "deepseek/deepseek-chat-v3.1"
+    :subagents-enabled t
     :projects
     ((:name "live-repo"
 	    :path "/repo/live"
@@ -117,6 +118,7 @@
 			  :cwd "/repo/live-wt"
 			  :model "model"
 			  :provider "provider"
+			  :subagents-enabled nil
 			  :created-at "2026-06-20T00:00:00Z"
 			  :updated-at "2026-06-20T00:00:00Z"
 			  :message-count 2
@@ -1028,6 +1030,7 @@
    (let ((choices '("openai-codex" "gpt-5.5" "openrouter" "deepseek/deepseek-chat-v3.1"))
          calls
          (refreshes 0))
+     (setq-local zerostack-board--snapshot zerostack-test--board-snapshot)
      (cl-letf (((symbol-function 'completing-read)
                 (lambda (&rest _) (pop choices)))
                ((symbol-function 'zerostack-board-refresh)
@@ -1038,15 +1041,18 @@
                 (pcase args
                   ('("providers") "anthropic\nopenai-codex\nopenrouter\n")
                   ('("models") "gpt-5.5\ngpt-5.1\n")
+                  ('("models" "openrouter") "deepseek/deepseek-chat-v3.1\n")
                   ('("set-provider" "openai-codex") "provider openai-codex\nmodel gpt-5.5\n")
                   ('("set-model" "gpt-5.5") "provider openai-codex\nmodel gpt-5.5\n")
                   ('("set-subagent-provider" "openrouter") "subagent_provider openrouter\nsubagent_model deepseek/deepseek-chat-v3.1\n")
+                  ('("set-subagents" "false") "subagents_enabled false\n")
                   ('("set-subagent-model" "deepseek/deepseek-chat-v3.1") "subagent_provider openrouter\nsubagent_model deepseek/deepseek-chat-v3.1\n")
                   (_ (error "unexpected config args: %S" args))))))
          (zerostack-board-set-default-provider)
          (zerostack-board-set-default-model)
          (zerostack-board-set-default-subagent-provider)
-         (zerostack-board-set-default-subagent-model)))
+         (zerostack-board-set-default-subagent-model)
+         (zerostack-board-set-default-subagents)))
      (should (equal (nreverse calls)
                     '(("providers")
                       ("set-provider" "openai-codex")
@@ -1054,9 +1060,10 @@
                       ("set-model" "gpt-5.5")
                       ("providers")
                       ("set-subagent-provider" "openrouter")
-                      ("models")
-                      ("set-subagent-model" "deepseek/deepseek-chat-v3.1"))))
-     (should (= refreshes 4)))))
+                      ("models" "openrouter")
+                      ("set-subagent-model" "deepseek/deepseek-chat-v3.1")
+                      ("set-subagents" "false"))))
+     (should (= refreshes 5)))))
 
 (ert-deftest zerostack-test-board-renders-provider-model-buttons ()
   (zerostack-test--with-board-buffer
@@ -1067,6 +1074,7 @@
    (should (search-forward " / " nil t))
    (should (search-forward "gpt-5.5" nil t))
    (should (search-forward "Subagents: " nil t))
+   (should (search-forward "on" nil t))
    (should (search-forward "openrouter" nil t))
    (should (search-forward "deepseek/deepseek-chat-v3.1" nil t))))
 
@@ -1142,6 +1150,14 @@
        (should (equal (nth 24 forms) '(list-sessions :request 24 :limit 7)))
        (should (equal (nth 25 forms) '(status :request 25)))
        (should (equal (nth 26 forms) '(timing :request 26)))))))
+
+(ert-deftest zerostack-test-subagents-menu-sends-session-command ()
+  (zerostack-test--with-buffer
+   (let (sent)
+     (setq zerostack--send-function (lambda (line) (push line sent)))
+     (zerostack-subagents-menu "off")
+     (should (equal (car (zerostack-test--sent-forms sent))
+                    '(subagents :request 1 :state "off"))))))
 
 (ert-deftest zerostack-test-timing-response-opens-separate-buffer ()
   (zerostack-test--with-buffer

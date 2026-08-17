@@ -700,6 +700,15 @@ The root is resolved with Projectile when available, then `project.el', then
     (zerostack-board-refresh)
     (message "zerostack subagent default %s" (replace-regexp-in-string "\n" ", " output))))
 
+(defun zerostack-board-set-default-subagents ()
+  "Enable or disable subagents by default."
+  (interactive)
+  (let* ((fields (cdr zerostack-board--snapshot))
+         (enabled (not (plist-get fields :subagents-enabled)))
+         (output (zerostack--config-command "set-subagents" (if enabled "true" "false"))))
+    (zerostack-board-refresh)
+    (message "zerostack default %s" (replace-regexp-in-string "\n" ", " output))))
+
 (defun zerostack-board-set-default-subagent-model ()
   "Switch the persisted default zerostack subagent model."
   (interactive)
@@ -736,6 +745,10 @@ The root is resolved with Projectile when available, then `project.el', then
      (zerostack-board--config-label (plist-get fields :model) "model")
      #'zerostack-board-set-default-model)
     (insert "\nSubagents: ")
+    (zerostack-board--insert-config-button
+     (if (plist-get fields :subagents-enabled) "on" "off")
+     #'zerostack-board-set-default-subagents)
+    (insert " / ")
     (zerostack-board--insert-config-button
      (zerostack-board--config-label (plist-get fields :subagent-provider) "provider")
      #'zerostack-board-set-default-subagent-provider)
@@ -1118,10 +1131,14 @@ The root is resolved with Projectile when available, then `project.el', then
   (if alive "*" " "))
 
 (defun zerostack-board--session-status (session &optional buffer)
-  "Return relative update time and token usage text for SESSION."
+  "Return relative update time, token usage, and subagent state for SESSION."
   (let ((age (zerostack-board--relative-time (or (plist-get session :updated-at) "")))
-        (usage (zerostack-board--session-usage session buffer)))
-    (format "  %s%s" age (if usage (format "  %s" usage) ""))))
+        (usage (zerostack-board--session-usage session buffer))
+        (subagents (unless (plist-get session :subagents-enabled) "subagents off")))
+    (format "  %s%s%s"
+            age
+            (if usage (format "  %s" usage) "")
+            (if subagents (format "  %s" subagents) ""))))
 
 (defun zerostack-board--session-usage (session buffer)
   "Return context usage text for SESSION, preferring live BUFFER state."
@@ -1857,6 +1874,13 @@ Return non-nil when DIRECTORY was newly added."
                            :request (zerostack--next-request)
                            :model model))
 
+(defun zerostack-subagents-menu (state)
+  "Enable or disable subagents for the current zerostack session."
+  (interactive (list (completing-read "Subagents: " '("on" "off") nil t)))
+  (zerostack--send-command 'subagents
+                           :request (zerostack--next-request)
+                           :state state))
+
 (defun zerostack-subagent-provider-menu (provider)
   "Switch the current zerostack session's subagent provider to PROVIDER."
   (interactive (list (zerostack--read-provider "Session subagent provider: " zerostack--subagent-provider)))
@@ -2290,7 +2314,7 @@ When BINARY is non-nil, DATA is written with binary coding."
   (defhydra zerostack-command-hydra (:hint nil :color blue)
     "
 Zerostack
-_k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear goal  _l_ loop  _h_ hydrate  _t_ thinking  _i_ timing  _p_ provider  _m_ model  _P_ subagent provider  _S_ subagent model  _T_ tools  _M_ MCP  _v_ view  _o_ artifact  _R_ restart
+_k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear goal  _l_ loop  _h_ hydrate  _t_ thinking  _i_ timing  _p_ provider  _m_ model  _e_ subagents  _P_ subagent provider  _S_ subagent model  _T_ tools  _M_ MCP  _v_ view  _o_ artifact  _R_ restart
 "
     ("k" zerostack-skill-menu)
     ("a" zerostack-attachment-menu)
@@ -2305,6 +2329,7 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
     ("i" zerostack-timing)
     ("p" zerostack-provider-menu)
     ("m" zerostack-model-menu)
+    ("e" zerostack-subagents-menu)
     ("P" zerostack-subagent-provider-menu)
     ("S" zerostack-subagent-model-menu)
     ("T" zerostack-list-tools)
@@ -2323,7 +2348,7 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
 (defun zerostack--command-menu-fallback ()
   "Fallback command menu used when Hydra is unavailable."
   (let* ((commands '("skill" "attach" "compact" "rewind" "redo" "loop" "thinking" "timing"
-                    "provider" "model" "subagent-provider" "subagent-model" "goal"
+                    "provider" "model" "subagents" "subagent-provider" "subagent-model" "goal"
                     "clear-goal" "hydrate" "tools" "mcp" "view" "artifact" "restart"))
          (choice (completing-read "Zerostack command: " commands nil t)))
     (pcase choice
@@ -2337,6 +2362,7 @@ _k_ skill  _a_ attach  _c_ compact  _w_ rewind  _u_ redo  _g_ goal  _G_ clear go
       ("timing" (zerostack-timing))
       ("provider" (call-interactively #'zerostack-provider-menu))
       ("model" (call-interactively #'zerostack-model-menu))
+      ("subagents" (call-interactively #'zerostack-subagents-menu))
       ("subagent-provider" (call-interactively #'zerostack-subagent-provider-menu))
       ("subagent-model" (call-interactively #'zerostack-subagent-model-menu))
       ("goal" (call-interactively #'zerostack-goal))

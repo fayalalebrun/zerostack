@@ -314,6 +314,15 @@ pub enum ConfigCommand {
         model: String,
     },
     #[cfg(feature = "subagents")]
+    #[command(about = "Enable or disable subagents by default")]
+    SetSubagents {
+        #[arg(
+            help = "true to enable subagents, false to disable them",
+            action = clap::ArgAction::Set
+        )]
+        enabled: bool,
+    },
+    #[cfg(feature = "subagents")]
     #[command(about = "Persist the default subagent provider and reset model to its default")]
     SetSubagentProvider {
         #[arg(help = "Provider name")]
@@ -362,6 +371,26 @@ pub enum AuthCommand {
         )]
         provider: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command, ConfigCommand};
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn parses_set_subagents_boolean_value() {
+        let cli = Cli::try_parse_from(["zerostack", "config", "set-subagents", "false"])
+            .expect("set-subagents false should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config {
+                command: ConfigCommand::SetSubagents { enabled: false }
+            })
+        ));
+    }
 }
 
 impl Cli {

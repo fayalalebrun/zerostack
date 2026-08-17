@@ -8,6 +8,8 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/reasoning" | "/thinking" => handle_reasoning(parts, ctx).await,
         "/mode" => handle_mode(parts, ctx).await,
         "/toggle" => handle_toggle(parts, ctx).await,
+        #[cfg(feature = "subagents")]
+        "/subagents" => handle_subagents(parts, ctx).await,
         "/editsys" => handle_editsys(parts, ctx).await,
         "/advisor" => {
             #[cfg(feature = "advisor")]
@@ -35,6 +37,42 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         }
         _ => Ok(()),
     }
+}
+
+#[cfg(feature = "subagents")]
+async fn handle_subagents(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    let enabled = match parts.get(1).copied() {
+        None => {
+            write_ok(
+                ctx.renderer,
+                format!(
+                    "subagents: {}",
+                    if ctx.session.resolve_subagents_enabled(ctx.cfg) {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+            );
+            return Ok(());
+        }
+        Some("on") => true,
+        Some("off") => false,
+        Some(other) => {
+            write_error(ctx.renderer, format!("invalid: '{}', use on or off", other));
+            return Ok(());
+        }
+    };
+    ctx.session.subagents_enabled = Some(enabled);
+    if !ctx.cli.no_session {
+        crate::session::storage::save_session(ctx.session)?;
+    }
+    ctx.rebuild_agent().await;
+    write_ok(
+        ctx.renderer,
+        format!("subagents: {}", if enabled { "on" } else { "off" }),
+    );
+    Ok(())
 }
 
 async fn handle_reasoning(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {

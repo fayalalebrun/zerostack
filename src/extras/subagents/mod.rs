@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 
@@ -21,8 +22,17 @@ pub(crate) struct SubagentConfig {
 }
 
 static CONFIG: Mutex<Option<SubagentConfig>> = Mutex::new(None);
+static ENABLED: AtomicBool = AtomicBool::new(true);
 
 static SUBAGENT_EVENT_TX: Mutex<Option<mpsc::Sender<AgentEvent>>> = Mutex::new(None);
+
+pub(crate) fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
 
 pub(crate) fn set_subagent_event_tx(tx: mpsc::Sender<AgentEvent>) {
     let mut guard = SUBAGENT_EVENT_TX.lock().unwrap_or_else(|e| e.into_inner());

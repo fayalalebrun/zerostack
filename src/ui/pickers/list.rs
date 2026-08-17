@@ -79,6 +79,7 @@ fn available_commands() -> Vec<&'static str> {
     #[cfg(feature = "subagents")]
     {
         cmds.push("/model-subagent");
+        cmds.push("/subagents");
         cmds.push("/models-subagent");
     }
 

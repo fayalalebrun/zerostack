@@ -170,6 +170,10 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
     {
         write_result(
             ctx.renderer,
+            "  /subagents [on|off]    show or set subagent use",
+        );
+        write_result(
+            ctx.renderer,
             "  /model-subagent [name] show or switch subagent model",
         );
         write_result(

@@ -300,6 +300,9 @@ pub struct Session {
     /// Whether reasoning/thinking is enabled for this session.
     #[serde(default = "default_true")]
     pub reasoning_enabled: bool,
+    #[cfg(feature = "subagents")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<CompactString>,
     /// Estimated tokens for the fixed request overhead that never lives in
@@ -392,9 +395,16 @@ impl Session {
             git_branch: None,
             git_status: None,
             reasoning_enabled: true,
+            #[cfg(feature = "subagents")]
+            subagents_enabled: None,
             reasoning_effort: None,
             overhead_tokens: 0,
         }
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_subagents_enabled(&self, _cfg: &crate::config::Config) -> bool {
+        self.subagents_enabled.unwrap_or(true)
     }
 
     /// Read the current git branch for `dir`, or `None` outside a repo / on a

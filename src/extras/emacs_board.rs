@@ -24,6 +24,7 @@ struct BoardSnapshot {
     model: String,
     subagent_provider: String,
     subagent_model: String,
+    subagents_enabled: bool,
     needs_attention: Vec<BoardSession>,
     projects: Vec<BoardProject>,
     loose_workspaces: Vec<BoardLooseWorkspace>,
@@ -53,6 +54,7 @@ struct BoardSession {
     cwd: String,
     model: String,
     provider: String,
+    subagents_enabled: bool,
     created_at: String,
     updated_at: String,
     message_count: usize,
@@ -116,7 +118,7 @@ fn collect_board() -> anyhow::Result<BoardSnapshot> {
             continue;
         }
         let live_meta = live.get(session.id.as_str());
-        let board_session = board_session(&session, live_meta);
+        let board_session = board_session(&session, live_meta, &cfg);
         if attention.contains(session.id.as_str()) {
             needs_attention.push(board_session.clone());
         }
@@ -169,11 +171,16 @@ fn collect_board() -> anyhow::Result<BoardSnapshot> {
         .collect::<Vec<_>>();
     sort_loose_workspaces(&mut loose_workspaces);
     sort_sessions(&mut needs_attention);
+    #[cfg(feature = "subagents")]
+    let subagents_enabled = cfg.task_enabled.unwrap_or(true);
+    #[cfg(not(feature = "subagents"))]
+    let subagents_enabled = false;
     Ok(BoardSnapshot {
         provider,
         model,
         subagent_provider,
         subagent_model,
+        subagents_enabled,
         needs_attention,
         projects,
         loose_workspaces,
@@ -305,13 +312,18 @@ fn project_from_builder(builder: ProjectBuilder) -> BoardProject {
     }
 }
 
-fn board_session(session: &Session, live: Option<&LiveSessionMeta>) -> BoardSession {
+fn board_session(session: &Session, live: Option<&LiveSessionMeta>, cfg: &Config) -> BoardSession {
+    #[cfg(feature = "subagents")]
+    let subagents_enabled = session.resolve_subagents_enabled(cfg);
+    #[cfg(not(feature = "subagents"))]
+    let subagents_enabled = false;
     BoardSession {
         id: session.id.to_string(),
         title: session.title(),
         cwd: session.working_dir.to_string(),
         model: session.model.to_string(),
         provider: session.provider.to_string(),
+        subagents_enabled,
         created_at: session.created_at.to_string(),
         updated_at: live
             .and_then(|meta| meta.updated_at.clone())
@@ -581,11 +593,12 @@ fn socket_alive(path: &Path) -> bool {
 
 fn board_to_sexp(snapshot: &BoardSnapshot) -> String {
     format!(
-        "(zerostack-board :version 1 :provider {} :model {} :subagent-provider {} :subagent-model {} :needs-attention ({}) :projects ({}) :loose-workspaces ({}))",
+        "(zerostack-board :version 1 :provider {} :model {} :subagent-provider {} :subagent-model {} :subagents-enabled {} :needs-attention ({}) :projects ({}) :loose-workspaces ({}))",
         sexp_quote(&snapshot.provider),
         sexp_quote(&snapshot.model),
         sexp_quote(&snapshot.subagent_provider),
         sexp_quote(&snapshot.subagent_model),
+        sexp_bool(snapshot.subagents_enabled),
         snapshot
             .needs_attention
             .iter()
@@ -657,13 +670,14 @@ fn worktree_to_sexp(worktree: &BoardWorktree) -> String {
 
 fn session_to_sexp(session: &BoardSession) -> String {
     format!(
-        "(:id {} :short-id {} :title {} :cwd {} :model {} :provider {} :created-at {} :updated-at {} :message-count {} :tokens {} :context-window {} :cost {:.6} :alive {} :pid {} :socket {})",
+        "(:id {} :short-id {} :title {} :cwd {} :model {} :provider {} :subagents-enabled {} :created-at {} :updated-at {} :message-count {} :tokens {} :context-window {} :cost {:.6} :alive {} :pid {} :socket {})",
         sexp_quote(&session.id),
         sexp_quote(short_id(&session.id)),
         sexp_quote(&session.title),
         sexp_quote(&session.cwd),
         sexp_quote(&session.model),
         sexp_quote(&session.provider),
+        sexp_bool(session.subagents_enabled),
         sexp_quote(&session.created_at),
         sexp_quote(&session.updated_at),
         session.message_count,
@@ -724,6 +738,7 @@ mod tests {
             cwd: "/repo".to_string(),
             model: "model".to_string(),
             provider: "provider".to_string(),
+            subagents_enabled: true,
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
             message_count: 1,
@@ -864,6 +879,7 @@ mod tests {
             model: "gpt-5.5".to_string(),
             subagent_provider: "openrouter".to_string(),
             subagent_model: "deepseek/deepseek-chat-v3.1".to_string(),
+            subagents_enabled: false,
             needs_attention: vec![session("attention-session", "2026-06-21T00:00:00Z", true)],
             projects,
             loose_workspaces: vec![BoardLooseWorkspace {
@@ -879,6 +895,7 @@ mod tests {
         assert!(sexp.contains(":model \"gpt-5.5\""));
         assert!(sexp.contains(":subagent-provider \"openrouter\""));
         assert!(sexp.contains(":subagent-model \"deepseek/deepseek-chat-v3.1\""));
+        assert!(sexp.contains(":subagents-enabled nil"));
         assert!(sexp.contains(":needs-attention"));
         assert!(sexp.contains(":id \"attention-session\""));
         assert!(sexp.contains(":loose-workspaces"));

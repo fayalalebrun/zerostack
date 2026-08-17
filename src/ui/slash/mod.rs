@@ -55,6 +55,8 @@ pub struct SlashCtx<'a> {
 
 impl SlashCtx<'_> {
     pub async fn rebuild_agent(&mut self) {
+        #[cfg(feature = "subagents")]
+        crate::extras::subagents::set_enabled(self.session.resolve_subagents_enabled(self.cfg));
         let model = self.client.completion_model(self.session.model.to_string());
         let temperature =
             crate::config::resolve_temperature(self.cli, self.cfg, &self.session.model);
@@ -98,6 +100,8 @@ impl SlashCtx<'_> {
         provider: &str,
         new_reasoning: bool,
     ) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "subagents")]
+        crate::extras::subagents::set_enabled(self.session.resolve_subagents_enabled(self.cfg));
         *self.client = crate::provider::create_client(
             provider,
             self.cli.api_key.as_deref(),
@@ -378,9 +382,8 @@ pub async fn handle_slash(
         "/prompt" | "/theme" | "/regen-prompts" | "/regen-themes" => {
             content::handle(&parts, &mut ctx).await
         }
-        "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys" | "/advisor" => {
-            settings::handle(&parts, &mut ctx).await
-        }
+        "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys" | "/advisor"
+        | "/subagents" => settings::handle(&parts, &mut ctx).await,
         "/sessions" | "/clear" | "/new" | "/undo" | "/retry" | "/quit" | "/exit" | "/history"
         | "/rewind" => session::handle(&parts, &mut ctx).await,
         "/goal" => goal::handle(&parts, &mut ctx).await,

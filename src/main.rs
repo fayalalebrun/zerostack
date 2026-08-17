@@ -194,6 +194,10 @@ async fn main() -> anyhow::Result<()> {
         &model,
         cfg.resolve_context_window(&provider, &model),
     );
+    #[cfg(feature = "subagents")]
+    {
+        session.subagents_enabled = Some(cfg.task_enabled.unwrap_or(true));
+    }
 
     // Resolve input/output token costs from quick models or defaults
     let qm_map = config::quick_models_map(&cfg);
@@ -251,6 +255,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     crate::agent::tools::goal::set_goal_state(session.goal.clone());
+    #[cfg(feature = "subagents")]
+    crate::extras::subagents::set_enabled(session.resolve_subagents_enabled(&cfg));
 
     sync_runtime_target_from_session(&mut provider, &mut model, &session);
 
@@ -889,6 +895,12 @@ fn handle_config_command(
             config::save_config(cfg)?;
             println!("provider {provider}");
             println!("model {model}");
+        }
+        #[cfg(feature = "subagents")]
+        cli::ConfigCommand::SetSubagents { enabled } => {
+            config::commands::set_subagents_enabled(cfg, *enabled);
+            config::save_config(cfg)?;
+            println!("subagents_enabled {enabled}");
         }
         #[cfg(feature = "subagents")]
         cli::ConfigCommand::SetSubagentProvider { provider } => {

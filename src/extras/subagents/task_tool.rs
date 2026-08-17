@@ -77,6 +77,11 @@ editing in a known location, grepping for a literal you will act on immediately.
     }
 
     async fn call(&self, args: TaskArgs) -> Result<String, ToolError> {
+        if !crate::extras::subagents::is_enabled() {
+            return Err(ToolError::Msg(
+                "task: subagents are disabled for this session".into(),
+            ));
+        }
         if args.prompts.is_empty() {
             return Err(ToolError::Msg("task: prompts must not be empty".into()));
         }
