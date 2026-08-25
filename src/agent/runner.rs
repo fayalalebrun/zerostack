@@ -244,6 +244,17 @@ pub(crate) async fn sleep_for_retry(delay_ms: u64) {
     sleep(Duration::from_millis(delay_ms)).await;
 }
 
+fn push_tool_call(tool_interactions: &mut Vec<Message>, tool_call: ToolCall) {
+    if let Some(Message::Assistant { content, .. }) = tool_interactions.last_mut() {
+        content.push(AssistantContent::ToolCall(tool_call));
+    } else {
+        tool_interactions.push(Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(tool_call)),
+        });
+    }
+}
+
 fn preserve_retry_output(
     history: &mut Vec<Message>,
     prompt: &str,
@@ -366,7 +377,11 @@ fn convert_history_inner(session: &Session) -> Vec<Message> {
     }
 
     let replayed_tool_result_ids = replayed_tool_result_ids(&session.messages[first_kept..]);
-    let mut replayed_tool_call_ids = HashSet::new();
+    let requires_call_id = matches!(
+        session.provider.as_str(),
+        "openai" | "openai-codex" | "codex"
+    );
+    let mut replayed_tool_call_ids = HashMap::new();
 
     for msg in &session.messages[first_kept..] {
         match msg.role {
@@ -399,9 +414,10 @@ fn convert_history_inner(session: &Session) -> Vec<Message> {
             MessageRole::ToolCall => {
                 if let Some(call) = msg.tool_call.as_ref()
                     && replayed_tool_result_ids.contains(call.id.as_str())
-                    && let Some(message) = tool_call_message(msg)
+                    && let Some((message, replayed_id, call_id)) =
+                        tool_call_message(msg, requires_call_id)
                 {
-                    replayed_tool_call_ids.insert(call.id.to_string());
+                    replayed_tool_call_ids.insert(call.id.to_string(), (replayed_id, call_id));
                     if let Message::Assistant {
                         content: tool_content,
                         ..
@@ -416,16 +432,18 @@ fn convert_history_inner(session: &Session) -> Vec<Message> {
             }
             MessageRole::ToolResult => {
                 if let Some(result) = msg.tool_result.as_ref()
-                    && replayed_tool_call_ids.contains(result.id.as_str())
-                    && let Some(replayed) = tool_result_messages(msg, &session.id)
+                    && let Some((replayed_id, call_id)) =
+                        replayed_tool_call_ids.remove(result.id.as_str())
+                    && let Some(replayed) =
+                        tool_result_messages(msg, &session.id, &replayed_id, call_id.as_deref())
                 {
                     messages.extend(replayed);
                 }
             }
-            MessageRole::SubagentToolCall => messages.push(Message::assistant(format!(
-                "[SubagentToolCall]: {}",
-                msg.content
-            ))),
+            MessageRole::SubagentToolCall if replayed_tool_call_ids.is_empty() => messages.push(
+                Message::assistant(format!("[SubagentToolCall]: {}", msg.content)),
+            ),
+            MessageRole::SubagentToolCall => {}
         }
     }
 
@@ -440,21 +458,44 @@ fn replayed_tool_result_ids(messages: &[SessionMessage]) -> HashSet<&str> {
         .collect()
 }
 
-fn tool_call_message(msg: &SessionMessage) -> Option<Message> {
+fn tool_call_message(
+    msg: &SessionMessage,
+    requires_call_id: bool,
+) -> Option<(Message, String, Option<String>)> {
     let call = msg.tool_call.as_ref()?;
-    Some(Message::Assistant {
-        id: None,
-        content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-            id: call.id.to_string(),
-            call_id: call.call_id.as_ref().map(ToString::to_string),
-            function: ToolFunction::new(call.name.to_string(), call.arguments.clone()),
-            signature: None,
-            additional_params: None,
-        })),
-    })
+    let missing_call_id = call.call_id.is_none() && requires_call_id;
+    let id = if missing_call_id {
+        format!("fc_{}", call.id)
+    } else {
+        call.id.to_string()
+    };
+    let call_id = call
+        .call_id
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| missing_call_id.then(|| call.id.to_string()));
+    Some((
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: id.clone(),
+                call_id: call_id.clone(),
+                function: ToolFunction::new(call.name.to_string(), call.arguments.clone()),
+                signature: None,
+                additional_params: None,
+            })),
+        },
+        id,
+        call_id,
+    ))
 }
 
-fn tool_result_messages(msg: &SessionMessage, session_id: &str) -> Option<Vec<Message>> {
+fn tool_result_messages(
+    msg: &SessionMessage,
+    session_id: &str,
+    id: &str,
+    call_id: Option<&str>,
+) -> Option<Vec<Message>> {
     let result = msg.tool_result.as_ref()?;
     let mut output = tool_result_output(msg);
     let mut messages = Vec::new();
@@ -472,8 +513,8 @@ fn tool_result_messages(msg: &SessionMessage, session_id: &str) -> Option<Vec<Me
         0,
         Message::User {
             content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: result.id.to_string(),
-                call_id: result.call_id.as_ref().map(ToString::to_string),
+                id: id.to_string(),
+                call_id: call_id.map(ToString::to_string),
                 content: OneOrMany::one(ToolResultContent::Text(Text::new(output))),
             })),
         },
@@ -683,7 +724,7 @@ where
                                 tool_names
                                     .insert(tool_call.id.clone(), tool_call.function.name.clone());
                                 tool_starts.insert(tool_call.id.clone(), Instant::now());
-                                tool_interactions.push(tool_call.clone().into());
+                                push_tool_call(&mut tool_interactions, tool_call.clone());
                                 let _ = event_tx
                                     .send(AgentEvent::ToolCall {
                                         id: CompactString::from(tool_call.id),
@@ -1172,7 +1213,7 @@ where
                 ..
             })) => {
                 stream_had_output = true;
-                tool_interactions.push(tool_call.clone().into());
+                push_tool_call(&mut tool_interactions, tool_call.clone());
                 tool_notes.push(format!("called tool `{}`", tool_call.function.name));
                 if let Some(tx) = event_tx {
                     let _ = tx
@@ -1403,14 +1444,14 @@ mod tests {
     #[cfg(feature = "subagents")]
     use super::{SubagentLimits, subagent_cutoff_prompt, subagent_invalid_tool_feedback};
     use super::{
-        convert_history, prepare_retry_continuation, retry_delay_ms,
+        convert_history, prepare_retry_continuation, push_tool_call, retry_delay_ms,
         streamed_assistant_content_has_output, streamed_provider_reasoning,
         streamed_reasoning_text,
     };
     use crate::session::{MessageRole, ProviderReasoning, ProviderReasoningContent, Session};
     use rig::agent::StreamingError;
     use rig::completion::message::{
-        AssistantContent, Reasoning, ReasoningContent, Text, UserContent,
+        AssistantContent, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction, UserContent,
     };
     use rig::completion::{CompletionError, Message};
     use rig::streaming::StreamedAssistantContent;
@@ -1566,6 +1607,31 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_history_synthesizes_missing_tool_call_ids() {
+        let mut session = Session::new("openai-codex", "gpt-5.6-codex", 128000);
+        session.add_tool_call_structured(
+            "read",
+            &serde_json::json!({ "path": "src/main.rs" }),
+            "call_1",
+            None,
+        );
+        session.add_tool_result_structured("read", "file contents", "call_1", None);
+
+        let history = convert_history(&session);
+        let Message::Assistant { content, .. } = &history[0] else {
+            panic!("expected assistant tool call message");
+        };
+        assert!(matches!(content.first(), AssistantContent::ToolCall(call)
+            if call.id == "fc_call_1" && call.call_id.as_deref() == Some("call_1")));
+
+        let Message::User { content } = &history[1] else {
+            panic!("expected user tool result message");
+        };
+        assert!(matches!(content.first(), UserContent::ToolResult(result)
+            if result.id == "fc_call_1" && result.call_id.as_deref() == Some("call_1")));
+    }
+
+    #[test]
     fn convert_history_preserves_partial_text_before_tool_call() {
         let mut session = Session::new("openai", "gpt-5.1", 128000);
         session.add_message(MessageRole::User, "inspect it");
@@ -1599,6 +1665,27 @@ mod tests {
 
         let history = convert_history(&session);
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn convert_history_drops_subagent_trace_between_tool_call_and_result() {
+        let mut session = Session::new("openai", "gpt-5.1", 128000);
+        session.add_message(MessageRole::User, "audit it");
+        session.add_tool_call_structured(
+            "task",
+            &serde_json::json!({ "prompts": ["inspect"] }),
+            "call_1",
+            None,
+        );
+        session.add_subagent_tool_call("read", &serde_json::json!({ "path": "src/main.rs" }));
+        session.add_tool_result_structured("task", "done", "call_1", None);
+
+        let history = convert_history(&session);
+        assert_eq!(history.len(), 3);
+        assert!(matches!(history[1], Message::Assistant { .. }));
+        assert!(matches!(&history[2], Message::User { content }
+            if matches!(content.first(), UserContent::ToolResult(result)
+                if result.id == "fc_call_1" && result.call_id.as_deref() == Some("call_1"))));
     }
 
     #[test]
@@ -1671,6 +1758,31 @@ mod tests {
                 "server_is_overloaded: Our servers are currently overloaded."
             ),
             Some(2_000)
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_share_one_assistant_message() {
+        let mut interactions = Vec::new();
+        for id in ["call_1", "call_2"] {
+            push_tool_call(
+                &mut interactions,
+                ToolCall::new(
+                    id.to_string(),
+                    ToolFunction::new("read".to_string(), serde_json::json!({})),
+                ),
+            );
+        }
+
+        assert_eq!(interactions.len(), 1);
+        let Message::Assistant { content, .. } = &interactions[0] else {
+            panic!("expected assistant tool-call message");
+        };
+        assert_eq!(content.len(), 2);
+        assert!(
+            content
+                .iter()
+                .all(|item| matches!(item, AssistantContent::ToolCall(_)))
         );
     }
 
