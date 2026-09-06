@@ -285,6 +285,11 @@
       "context": 372000
     },
     {
+      "id": "gpt-6-astra",
+      "name": "GPT-6-Astra",
+      "context": 272000
+    },
+    {
       "id": "o1",
       "name": "o1",
       "context": 200000

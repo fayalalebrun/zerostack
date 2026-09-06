@@ -109,5 +109,6 @@ mod tests {
         let codex = catalog_entries("openai-codex").unwrap();
         assert_eq!(openai.len(), codex.len());
         assert!(codex.iter().any(|m| m.id == "gpt-5.5"));
+        assert!(codex.iter().any(|m| m.id == "gpt-6-astra"));
     }
 }
